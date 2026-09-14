@@ -269,10 +269,20 @@ func columns() []col {
 	}
 }
 
-// buildTable 依据数据渲染表格主体（表头 + 各行 + 可选合计行）为等宽行切片。
+// buildTable 依据数据渲染表格主体（表头 + 分隔线 + 各行 + 可选合计行）。
 //
-// 所有行的显示宽度逐列一致：列宽取表头与该列所有取值中的最大显示宽度
-// （CJK 按 2 列计），因此中文表头不会把后续列挤偏。
+// 分隔符全部用 ASCII（| - +），不用 ─ 之类的制表符：U+2500 的 East Asian Width
+// 属性是 Ambiguous —— 终端可按 1 或 2 列渲染，于是分割线与表格宽度对不上
+// （中文环境常按 2 列画）。ASCII 恒占 1 列，宽度确定、不随终端而异。
+//
+// 对齐靠构造而非估算：每列统一是「空格 + 内容 + 空格」，段间由 | 连接，
+// 故 | 与分隔线上的 + 必然落在同一列。
+//
+//	行：   ' a | bb | c '
+//	分隔： '--- + ---- + ---'
+//
+// 列宽取表头与该列所有取值中的最大显示宽度（CJK 按 2 列计），因此中文表头
+// 不会把后续列挤偏。
 func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 	cols := columns()
 
@@ -292,6 +302,7 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 	sortModels(body, sortKey)
 
 	withTotal := len(body) > 1
+	totalLabel := "合计"
 
 	// 列宽：表头与所有数据取最大显示宽度。
 	widths := make([]int, len(vis))
@@ -308,7 +319,6 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 	for _, m := range body {
 		measure(m)
 	}
-	totalLabel := "合计"
 	if withTotal {
 		measure(total)
 		if w := displayWidth(totalLabel); w > widths[0] {
@@ -316,66 +326,64 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 		}
 	}
 
-	// 渲染一行：按列宽补齐。首列左对齐（模型名），其余右对齐（数字）。
-	renderRow := func(first string, m modelStat, firstOverride bool) string {
-		var b strings.Builder
-		for i, c := range vis {
-			if i > 0 {
-				b.WriteByte(' ')
-			}
-			var cell string
-			switch {
-			case i == 0 && firstOverride:
-				cell = first
-			default:
-				cell = c.value(m)
-			}
-			if c.right {
-				b.WriteString(padLeft(cell, widths[i]))
-			} else {
-				b.WriteString(padRight(cell, widths[i]))
-			}
+	// 单元格：首列左对齐（模型名），数字列右对齐。
+	cell := func(s string, i int) string {
+		if vis[i].right {
+			return padLeft(s, widths[i])
 		}
+		return padRight(s, widths[i])
+	}
+
+	// 数据行：' ' + cell + ' ' 组成一段，段间以 " | " 相连，行首行尾各留一空格。
+	renderRow := func(label string, m modelStat, useLabel bool) string {
+		var b strings.Builder
+		b.WriteByte(' ')
+		for i := range vis {
+			if i > 0 {
+				b.WriteString(" | ")
+			}
+			s := vis[i].value(m)
+			if i == 0 && useLabel {
+				s = label
+			}
+			b.WriteString(cell(s, i))
+		}
+		b.WriteByte(' ')
 		return b.String()
 	}
 
-	// 表头。
-	heads := make([]col, len(vis))
-	copy(heads, vis)
+	// 表头行：与数据行同构，保证竖线逐列同位。
 	var head strings.Builder
-	for i, c := range heads {
+	head.WriteByte(' ')
+	for i, c := range vis {
 		if i > 0 {
-			head.WriteByte(' ')
+			head.WriteString(" | ")
 		}
-		if c.right {
-			head.WriteString(padLeft(c.head, widths[i]))
-		} else {
-			head.WriteString(padRight(c.head, widths[i]))
-		}
+		head.WriteString(cell(c.head, i))
 	}
+	head.WriteByte(' ')
 
-	sep := strings.Repeat("─", totalWidth(widths))
+	// 分隔线：逐字符与表头/数据行对齐 ——
+	// 行首空格→'-'，每段内容→'-'×列宽，两侧空格与段间 " | "→'-'，
+	// 竖线位置→'+'。直接按同构规则生成，故长度必然与数据行相等。
+	var sep strings.Builder
+	sep.WriteString("-") // 对应表头的行首空格
+	for i := range vis {
+		if i > 0 {
+			sep.WriteString("-+-") // 对应 " | "
+		}
+		sep.WriteString(strings.Repeat("-", widths[i]))
+	}
+	sep.WriteString("-") // 对应表头的行尾空格
 
-	out := []string{head.String(), sep}
+	out := []string{head.String(), sep.String()}
 	for _, m := range body {
 		out = append(out, renderRow("", m, false))
 	}
 	if withTotal {
-		out = append(out, sep, renderRow(totalLabel, total, true))
+		out = append(out, sep.String(), renderRow(totalLabel, total, true))
 	}
 	return out
-}
-
-// totalWidth 计算一行渲染后的总显示宽度（各列宽 + 列间单空格）。
-func totalWidth(widths []int) int {
-	n := 0
-	for i, w := range widths {
-		if i > 0 {
-			n++
-		}
-		n += w
-	}
-	return n
 }
 
 // buildFrame 组装完整帧（标题 + 表格 + 尾注），返回逐行切片。
@@ -391,7 +399,17 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
 		title += " · 运行 " + humanDuration(time.Duration(st.UptimeSec)*time.Second)
 	}
 	lines = append(lines, title)
-	rule := strings.Repeat("─", displayWidth(title))
+
+	// 分隔线一律用 ASCII '-'：'─'(U+2500) 的 East Asian Width 是 Ambiguous，
+	// 终端可能按 2 列渲染，导致与表格对不齐。ASCII 恒占 1 列。
+	//
+	// 表格存在时用表格宽度（视觉上与表格连成一体）；否则退回标题宽度，
+	// 保证错误/未启用/无数据这些短帧也有一条与内容相称的横线。
+	ruleWidth := displayWidth(title)
+	if st != nil && st.Enabled && len(st.Models) > 0 {
+		ruleWidth = displayWidth(buildTable(st.Models, st.Total, sortKey)[0])
+	}
+	rule := strings.Repeat("-", ruleWidth)
 
 	if fetchErr != nil {
 		// 帧内报错：保留标题与分隔线（帧结构稳定），错误信息作为表体。
@@ -410,10 +428,8 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
 		return append(lines, rule, "暂无数据 —— 统计窗口内没有请求记录（-json 可取原始字段）")
 	}
 
-	table := buildTable(st.Models, st.Total, sortKey)
-	// 分隔线取表格自身宽度，与表格连成一体（标题那行可能有 emoji，宽度不必相同）。
-	lines = append(lines, strings.Repeat("─", displayWidth(table[0])))
-	lines = append(lines, table...)
+	lines = append(lines, rule)
+	lines = append(lines, buildTable(st.Models, st.Total, sortKey)...)
 	return append(lines, "扣费单位=账号积分（非货币）· 完整字段见 -json")
 }
 

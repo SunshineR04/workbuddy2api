@@ -348,12 +348,13 @@ func TestTableFailedColumnHidden(t *testing.T) {
 // TestTableColumnsAligned 全帧行宽一致 —— 这是对齐的回归断言。
 //
 // 用代码而非肉眼保证：含中文表头的行不比数据行窄/宽。若有人改回 %-10s 式
-// 按 rune 补齐，中文列会短 1 列，此测试立刻失败。
+// 按 rune 补齐、或把分隔线写成固定长度，此测试立刻失败。
 func TestTableColumnsAligned(t *testing.T) {
 	cases := [][]modelStat{
 		{mkModel("deepseek-v4.1-flash", 131, 0)},
 		{mkModel("a", 131, 0), mkModel("中文模型名", 70, 3)},
 		{mkModel("超长模型名超长模型名超长模型名超长模型名超长模型名", 5, 0)},
+		{mkModel("x", 0, 0)}, // 全零行：占位符也要保持等宽
 	}
 	for i, rows := range cases {
 		tbl := buildTable(rows, mkModel("(all)", 131, 0), "requests")
@@ -364,6 +365,98 @@ func TestTableColumnsAligned(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestTableSeparatorAlignsBars 分隔线上的 + 必须与各行的 | 落在同一显示列。
+//
+// 这是"竖线分隔"能否看齐的核心：仅比较总宽度不够 —— 宽度相等但每段分配
+// 不同（如 + 比 | 多占一列）同样会错位。故按显示列逐一比对。
+func TestTableSeparatorAlignsBars(t *testing.T) {
+	rows := []modelStat{mkModel("a", 131, 0), mkModel("中文模型名较长", 70, 3)}
+	tbl := buildTable(rows, mkModel("(all)", 201, 3), "requests")
+
+	// 找出所有含竖线的行（表头与每个数据行），以及所有分隔线行。
+	var dataLines, sepLines []string
+	for _, l := range tbl {
+		switch {
+		case strings.Contains(l, "|"):
+			dataLines = append(dataLines, l)
+		case strings.Contains(l, "+") && strings.Contains(l, "-"):
+			sepLines = append(sepLines, l)
+		}
+	}
+	if len(dataLines) == 0 || len(sepLines) == 0 {
+		t.Fatalf("未找到竖线行或分隔线行:\n%s", strings.Join(tbl, "\n"))
+	}
+
+	want := barColumns(sepLines[0], '+')
+	for _, l := range dataLines {
+		if got := barColumns(l, '|'); !equalInts(got, want) {
+			t.Errorf("竖线列位 %v 与分隔线 + 列位 %v 不一致:\n  %q", got, want, l)
+		}
+	}
+	for _, l := range sepLines[1:] {
+		if got := barColumns(l, '+'); !equalInts(got, want) {
+			t.Errorf("分隔线之间列位不一致: %v vs %v", got, want)
+		}
+	}
+}
+
+// TestTableSeparatorWidthMatchesRows 分隔线与数据行等宽（TestTableColumnsAligned
+// 已覆盖等宽，此处单独断言以便失败信息更直白）。
+func TestTableSeparatorWidthMatchesRows(t *testing.T) {
+	tbl := buildTable([]modelStat{mkModel("m", 5, 0)}, mkModel("(all)", 5, 0), "requests")
+	if len(tbl) < 3 {
+		t.Fatalf("表至少应有表头+分隔线+1 行，得到 %d 行", len(tbl))
+	}
+	hdr, sep := displayWidth(tbl[0]), displayWidth(tbl[1])
+	if hdr != sep {
+		t.Errorf("表头宽 %d ≠ 分隔线宽 %d\n  %q\n  %q", hdr, sep, tbl[0], tbl[1])
+	}
+}
+
+// TestTableUsesOnlyASCIIBorder 边框只允许 ASCII —— 防回归到 ─(U+2500)。
+//
+// U+2500 的 East Asian Width 是 Ambiguous：终端可按 1 或 2 列渲染，导致
+// 分隔线与表格对不齐（这正是改用 ASCII 的原因）。故断言分隔线字符集。
+func TestTableUsesOnlyASCIIBorder(t *testing.T) {
+	tbl := buildTable([]modelStat{mkModel("m", 5, 0), mkModel("n", 7, 0)}, mkModel("(all)", 12, 0), "requests")
+	for _, l := range tbl {
+		for _, r := range l {
+			if r > 0x7F {
+				// 允许表头/数据里的 CJK，只对"线"字符设限：
+				// 制表符区块（U+2500–U+257F）一律不允许出现在表格里。
+				if r >= 0x2500 && r <= 0x257F {
+					t.Errorf("表格出现制表符 U+%04X（歧义宽度，应改用 ASCII）: %q", r, l)
+				}
+			}
+		}
+	}
+}
+
+// barColumns 返回 s 中所有目标字符所在的显示列号（0-based）。
+func barColumns(s string, target rune) []int {
+	var out []int
+	col := 0
+	for _, r := range s {
+		if r == target {
+			out = append(out, col)
+		}
+		col += runeWidth(r)
+	}
+	return out
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestDisplayWidth CJK 按 2 列计 —— 这是上面所有对齐的前提。
