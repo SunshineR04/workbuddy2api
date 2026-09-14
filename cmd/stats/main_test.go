@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -218,11 +219,10 @@ func TestRenderDisabled(t *testing.T) {
 	}
 }
 
-// TestRenderZeroFields 全零统计（如网关刚重启、尚无请求）不应崩溃或输出 NaN。
-// 这是真实会遇到的边界：进程刚起、或统计被 reset 之后。
-func TestRenderZeroFields(t *testing.T) {
+// TestRenderNoData 统计窗口内无请求（models 为空）时给出提示而非空表头。
+func TestRenderNoData(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"enabled":true,"total":{},"models":[]}`))
+		_, _ = w.Write([]byte(`{"enabled":true,"uptime_sec":5,"total":{},"models":[]}`))
 	}))
 	defer srv.Close()
 
@@ -231,11 +231,11 @@ func TestRenderZeroFields(t *testing.T) {
 			t.Errorf("renderOnce: %v", err)
 		}
 	})
+	if !strings.Contains(out, "暂无数据") {
+		t.Errorf("应提示暂无数据，得到: %s", out)
+	}
 	if strings.Contains(out, "NaN") || strings.Contains(out, "+Inf") {
 		t.Errorf("零值不应产生 NaN/Inf，得到: %s", out)
-	}
-	if !strings.Contains(out, "总请求") {
-		t.Errorf("应仍有基本框架，得到: %s", out)
 	}
 }
 
@@ -285,6 +285,219 @@ func TestSortModels(t *testing.T) {
 		if rs[0].Model != c.want {
 			t.Errorf("key=%s 首行 = %s, want %s", c.key, rs[0].Model, c.want)
 		}
+	}
+}
+
+// ─── 单表渲染 ─────────────────────────────────────────────────────────────
+
+// mkModel 造一行统计，只填关心的字段。
+func mkModel(name string, req int64, failed int64) modelStat {
+	return modelStat{
+		Model: name, Requests: req, Success: req - failed, Failed: failed,
+		AvgTTFBMS: 4500, AvgLatencyMS: 6900, TokensPerSec: 240,
+		PromptTokens: 40_000_000, CompletionTokens: 77_000, TotalTokens: 40_077_000,
+		CacheHitTokens: 39_000_000, CacheMissTokens: 1_000_000, CacheHitRate: 0.973,
+		Credit: 31.73, CreditPerReq: 0.242,
+	}
+}
+
+// TestTableSingleModelNoTotalRow 单模型时不出现合计行 —— 那一行本身就是汇总。
+func TestTableSingleModelNoTotalRow(t *testing.T) {
+	rows := []modelStat{mkModel("deepseek-v4.1-flash", 131, 0)}
+	table := buildTable(rows, mkModel("(all)", 131, 0), "requests")
+
+	joined := strings.Join(table, "\n")
+	if strings.Contains(joined, "合计") {
+		t.Errorf("单模型不应有合计行:\n%s", joined)
+	}
+	// 表头 + 分隔线 + 1 数据行 = 3 行
+	if len(table) != 3 {
+		t.Errorf("行数 = %d, want 3:\n%s", len(table), joined)
+	}
+}
+
+// TestTableMultiModelHasTotalRow 多模型时出现分隔线 + 合计行。
+func TestTableMultiModelHasTotalRow(t *testing.T) {
+	rows := []modelStat{mkModel("a", 131, 0), mkModel("b", 70, 0)}
+	table := buildTable(rows, mkModel("(all)", 201, 0), "requests")
+
+	joined := strings.Join(table, "\n")
+	if !strings.Contains(joined, "合计") {
+		t.Errorf("多模型应有合计行:\n%s", joined)
+	}
+	// 表头 + 分隔线 + 2 数据 + 分隔线 + 合计 = 6 行
+	if len(table) != 6 {
+		t.Errorf("行数 = %d, want 6:\n%s", len(table), joined)
+	}
+}
+
+// TestTableFailedColumnHidden 全部成功时不出现失败列（常态下省 4 列宽度）；
+// 任一模型有失败则出现。
+func TestTableFailedColumnHidden(t *testing.T) {
+	noFail := buildTable([]modelStat{mkModel("a", 10, 0)}, mkModel("(all)", 10, 0), "requests")
+	if strings.Contains(strings.Join(noFail, "\n"), "失败") {
+		t.Errorf("无失败时不应出现失败列:\n%s", strings.Join(noFail, "\n"))
+	}
+
+	withFail := buildTable([]modelStat{mkModel("a", 10, 2)}, mkModel("(all)", 10, 2), "requests")
+	if !strings.Contains(strings.Join(withFail, "\n"), "失败") {
+		t.Errorf("有失败时应出现失败列:\n%s", strings.Join(withFail, "\n"))
+	}
+}
+
+// TestTableColumnsAligned 全帧行宽一致 —— 这是对齐的回归断言。
+//
+// 用代码而非肉眼保证：含中文表头的行不比数据行窄/宽。若有人改回 %-10s 式
+// 按 rune 补齐，中文列会短 1 列，此测试立刻失败。
+func TestTableColumnsAligned(t *testing.T) {
+	cases := [][]modelStat{
+		{mkModel("deepseek-v4.1-flash", 131, 0)},
+		{mkModel("a", 131, 0), mkModel("中文模型名", 70, 3)},
+		{mkModel("超长模型名超长模型名超长模型名超长模型名超长模型名", 5, 0)},
+	}
+	for i, rows := range cases {
+		tbl := buildTable(rows, mkModel("(all)", 131, 0), "requests")
+		want := displayWidth(tbl[0])
+		for j, line := range tbl {
+			if got := displayWidth(line); got != want {
+				t.Errorf("case %d 行 %d 宽度 = %d, want %d\n  %q", i, j, got, want, line)
+			}
+		}
+	}
+}
+
+// TestDisplayWidth CJK 按 2 列计 —— 这是上面所有对齐的前提。
+func TestDisplayWidth(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"abc", 3},
+		{"总请求", 6},
+		{"首字", 4},
+		{"tok/s", 5},
+		{"97.3%", 5},
+		{"", 0},
+		{"a中", 3},
+	}
+	for _, c := range cases {
+		if got := displayWidth(c.in); got != c.want {
+			t.Errorf("displayWidth(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestPadAndTruncate 补齐与截断都按显示宽度而非 rune 数。
+func TestPadAndTruncate(t *testing.T) {
+	if got := padRight("中", 4); got != "中  " {
+		t.Errorf("padRight = %q", got)
+	}
+	if got := padLeft("中", 4); got != "  中" {
+		t.Errorf("padLeft = %q", got)
+	}
+	if got := padRight("abcd", 3); got != "abcd" {
+		t.Errorf("已超宽不应截断，得到 %q", got)
+	}
+	// 上限 6 列：省略号占 2 列 → 内容预算 4 列 → 2 个汉字。
+	got := truncateWidth("中文模型名很长", 6)
+	if displayWidth(got) > 6 {
+		t.Errorf("truncateWidth 超出上限: %q (宽度 %d)", got, displayWidth(got))
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("截断应加省略号，得到 %q", got)
+	}
+}
+
+// TestBuildFrameStructure 帧头部与尾注结构。
+func TestBuildFrameStructure(t *testing.T) {
+	st := &statsResponse{
+		Enabled: true, UptimeSec: 5340,
+		Total:  mkModel("(all)", 131, 0),
+		Models: []modelStat{mkModel("deepseek-v4.1-flash", 131, 0)},
+	}
+	frame := buildFrame(st, "requests", nil)
+
+	if !strings.Contains(frame[0], "网关请求统计") {
+		t.Errorf("首行应为标题，得到 %q", frame[0])
+	}
+	if !strings.Contains(frame[0], "运行 1h29m") {
+		t.Errorf("标题应含运行时长，得到 %q", frame[0])
+	}
+	if !strings.Contains(frame[len(frame)-1], "账号积分") {
+		t.Errorf("尾注应说明扣费单位，得到 %q", frame[len(frame)-1])
+	}
+	// 表体存在（含模型名）。
+	if !strings.Contains(strings.Join(frame, "\n"), "deepseek-v4.1-flash") {
+		t.Errorf("帧应含模型行:\n%s", strings.Join(frame, "\n"))
+	}
+}
+
+// TestBuildFrameFetchError 拉取失败时错误进帧内（而非 stderr），
+// 且帧结构仍成立 —— watch 模式依赖行数稳定才不覆盖错位。
+func TestBuildFrameFetchError(t *testing.T) {
+	frame := buildFrame(&statsResponse{}, "requests", fmt.Errorf("连接网关失败（http://x）: refused"))
+	joined := strings.Join(frame, "\n")
+	if !strings.Contains(joined, "连接网关失败") {
+		t.Errorf("错误应出现在帧内:\n%s", joined)
+	}
+	if len(frame) < 3 {
+		t.Errorf("帧结构应保持（标题+分隔线+错误），得到 %d 行", len(frame))
+	}
+}
+
+// TestBuildFrameNoData models 为空时提示，且不产生表格。
+func TestBuildFrameNoData(t *testing.T) {
+	frame := buildFrame(&statsResponse{Enabled: true, UptimeSec: 5}, "requests", nil)
+	joined := strings.Join(frame, "\n")
+	if !strings.Contains(joined, "暂无数据") {
+		t.Errorf("应提示暂无数据:\n%s", joined)
+	}
+}
+
+// TestValidateFlags watch 与 json 互斥。
+func TestValidateFlags(t *testing.T) {
+	if err := validateFlags(0, true); err != nil {
+		t.Errorf("仅 -json 应通过，得到 %v", err)
+	}
+	if err := validateFlags(5*time.Second, false); err != nil {
+		t.Errorf("仅 -watch 应通过，得到 %v", err)
+	}
+	if err := validateFlags(5*time.Second, true); err == nil {
+		t.Error("-watch 与 -json 同时使用应报错")
+	} else if !strings.Contains(err.Error(), "json") {
+		t.Errorf("错误应点明冲突的选项，得到 %v", err)
+	}
+}
+
+// TestRewriteFrameEscapes 覆盖重绘的转义序列：上移量等于上一帧行数，
+// 每行擦到行尾，帧尾清屏。这是"原地覆盖"的核心 —— 若上移量算错，
+// 帧就会错位或堆叠（Windows 上原本的表现）。
+func TestRewriteFrameEscapes(t *testing.T) {
+	// 第二帧（上一帧 5 行，本帧 3 行）：
+	lines := []string{"a", "b", "c"}
+	got := captureStdout(t, func() { rewriteFrame(lines, 5) })
+
+	if !strings.HasPrefix(got, "\033[5A") {
+		n := len(got)
+		if n > 12 {
+			n = 12
+		}
+		t.Errorf("应以光标上移 5 行开头，得到 %q", got[:n])
+	}
+	if n := strings.Count(got, "\033[K"); n != len(lines) {
+		t.Errorf("每行应有一个 \\033[K（%d 个），得到 %d", len(lines), n)
+	}
+	if !strings.Contains(got, "\033[J") {
+		t.Error("帧尾应有 \\033[J 清除多余旧行")
+	}
+	if !strings.Contains(got, "a") || !strings.Contains(got, "c") {
+		t.Errorf("应包含全部行内容，得到 %q", got)
+	}
+
+	// 首帧（prevLines=0）不应上移光标 —— 否则会吃掉已有输出。
+	first := captureStdout(t, func() { rewriteFrame(lines, 0) })
+	if strings.Contains(first, "[0A") {
+		t.Errorf("首帧不应包含上移转义，得到 %q", first)
 	}
 }
 

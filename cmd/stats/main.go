@@ -2,34 +2,37 @@
 //
 // 用法:
 //
-//	go run ./cmd/stats              # 一次性快照（人类可读）
+//	go run ./cmd/stats              # 一次性快照
 //	go run ./cmd/stats -json        # JSON 透传（供脚本消费）
-//	go run ./cmd/stats -watch 5s    # 持续刷新（Ctrl+C 退出）
+//	go run ./cmd/stats -watch 5s    # 原地刷新（Ctrl+C 退出）
 //
 // 为什么是这个形态：网关（server）才是所有流量的必经点，统计在网关侧采集；
-// 本工具只做渲染，因此无状态、无依赖、用完即退 —— 不像常驻面板那样占内存。
+// 本工具只做渲染 —— 无状态、无依赖、用完即退，不像常驻面板那样占内存。
 //
 // 配置解析与网关侧其它工具一致：读 config.json 的 listen（取端口）与 api_key；
 // 可用 WB2A_URL 直接指定地址、WB2A_CONFIG 指定配置文件路径。
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 // modelStat 对应网关 /v1/stats 的单行统计（total 行与 models 元素同构）。
 //
 // 字段全部用值类型 + 零值兜底：网关在不同版本下可能缺字段（如未采集 usage 时
-// tokens 全为 0），缺字段应显示为 0 而不是让整表崩掉。
+// tokens 全为 0），缺字段应显示为占位符而不是让整表崩掉。
 type modelStat struct {
 	Model            string  `json:"model"`
 	Requests         int64   `json:"requests"`
@@ -65,7 +68,7 @@ type statsResponse struct {
 func main() {
 	var (
 		jsonOut  = flag.Bool("json", false, "输出原始 JSON（供脚本消费），不做格式化")
-		watch    = flag.Duration("watch", 0, "持续刷新间隔（如 5s）；0 = 只取一次快照")
+		watch    = flag.Duration("watch", 0, "原地刷新间隔（如 5s）；0 = 只取一次快照")
 		timeout  = flag.Duration("timeout", 15*time.Second, "HTTP 请求超时")
 		sortKey  = flag.String("sort", "requests", "按模型排序字段：requests|ttfb|tokens|credit")
 		showHelp = flag.Bool("h", false, "显示帮助")
@@ -80,28 +83,39 @@ func main() {
 		return
 	}
 
+	// -watch 与 -json 互斥：watch 会给每帧加光标控制转义，JSON 消费者无法解析；
+	// 而 watch 的意义是"人看着刷新"，与机器消费本就互斥。
+	if err := validateFlags(*watch, *jsonOut); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(2)
+	}
+
 	baseURL, apiKey, err := resolveGateway()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "解析网关地址失败: %v\n", err)
 		os.Exit(1)
 	}
 
+	// 是否具备控制台能力：Windows 需显式开启 VT，且被重定向时无法开启。
+	// 不可用时 watch 回落为逐帧滚动输出（仍有完整内容，只是不覆盖）。
+	tty := enableVT()
+
 	if *watch > 0 {
-		// 首帧清屏，后续每帧回到左上角覆盖 —— 避免 watch 模式下滚动刷屏。
-		for {
-			fmt.Print("\033[H\033[2J")
-			if err := renderOnce(baseURL, apiKey, *timeout, *jsonOut, *sortKey); err != nil {
-				fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
-			}
-			fmt.Printf("\n刷新间隔 %s · Ctrl+C 退出\n", *watch)
-			time.Sleep(*watch)
-		}
+		os.Exit(runWatch(baseURL, apiKey, *timeout, *sortKey, *watch, tty))
 	}
 
 	if err := renderOnce(baseURL, apiKey, *timeout, *jsonOut, *sortKey); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// validateFlags 校验参数组合。单独成函数便于测试（main 直接 os.Exit）。
+func validateFlags(watch time.Duration, jsonOut bool) error {
+	if watch > 0 && jsonOut {
+		return fmt.Errorf("-watch 与 -json 不能同时使用（watch 用于人看，json 用于脚本消费）")
+	}
+	return nil
 }
 
 // resolveGateway 决定网关地址与 api_key。
@@ -192,100 +206,383 @@ func renderOnce(baseURL, apiKey string, timeout time.Duration, jsonOut bool, sor
 		return nil
 	}
 
+	for _, line := range buildFrame(st, sortKey, nil) {
+		fmt.Println(line)
+	}
+	return nil
+}
+
+// ─── 单表渲染 ─────────────────────────────────────────────────────────────
+//
+// 设计：汇总与明细合并为一张表 —— 每个模型一行，统计全量走"合计"行
+// （仅多模型时出现；单模型时那一行本身就是汇总，重复展示没有信息量）。
+// 失败列按需出现：全部成功时不占位，一旦有失败自动出现以引起注意。
+
+// col 定义一列：表头、取值、对齐、是否在生成表头时提供。
+//
+// show 为 nil 表示恒显示；否则由 buildTable 依据整表数据决定是否纳入该列。
+type col struct {
+	head  string
+	value func(modelStat) string
+	right bool
+	show  func(rows []modelStat) bool
+}
+
+// columns 返回列定义。顺序即渲染顺序。
+//
+// 失败列用 show 回调：只要任一行的失败数非 0（含合计行）才纳入，
+// 避免常态下白白占 4 列宽度。
+func columns() []col {
+	return []col{
+		{head: "模型", value: func(m modelStat) string {
+			return truncateWidth(m.Model, 28)
+		}},
+		{head: "请求", right: true, value: func(m modelStat) string { return fmtInt(m.Requests) }},
+		{head: "失败", right: true, value: func(m modelStat) string { return fmtInt(m.Failed) },
+			show: func(rows []modelStat) bool {
+				for _, m := range rows {
+					if m.Failed > 0 {
+						return true
+					}
+				}
+				return false
+			}},
+		{head: "首字", right: true, value: func(m modelStat) string { return fmtMillis(m.AvgTTFBMS) }},
+		{head: "耗时", right: true, value: func(m modelStat) string { return fmtMillis(m.AvgLatencyMS) }},
+		{head: "吞吐", right: true, value: func(m modelStat) string { return fmtRate(m.TokensPerSec) }},
+		{head: "输入/输出", right: true, value: func(m modelStat) string {
+			// 无 usage 观测时（无 token 数据）显示占位符，不显示 0/0 误导。
+			if m.PromptTokens == 0 && m.CompletionTokens == 0 {
+				return "-"
+			}
+			return fmtTokens(m.PromptTokens) + "/" + fmtTokens(m.CompletionTokens)
+		}},
+		{head: "缓存命中", right: true, value: func(m modelStat) string {
+			if m.CacheHitTokens+m.CacheMissTokens == 0 {
+				return "-"
+			}
+			return fmt.Sprintf("%.1f%%", m.CacheHitRate*100)
+		}},
+		{head: "扣费", right: true, value: func(m modelStat) string {
+			return fmt.Sprintf("%.2f", m.Credit)
+		}},
+	}
+}
+
+// buildTable 依据数据渲染表格主体（表头 + 各行 + 可选合计行）为等宽行切片。
+//
+// 所有行的显示宽度逐列一致：列宽取表头与该列所有取值中的最大显示宽度
+// （CJK 按 2 列计），因此中文表头不会把后续列挤偏。
+func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
+	cols := columns()
+
+	// 失败列的显隐要考虑合计行：明细全 0 但合计非 0 在数学上不可能，
+	// 但显式纳入可让边界（如部分模型缺数据）行为可预期。
+	vis := make([]col, 0, len(cols))
+	probe := append(append([]modelStat(nil), rows...), total)
+	for _, c := range cols {
+		if c.show == nil || c.show(probe) {
+			vis = append(vis, c)
+		}
+	}
+
+	// 排序后的明细（合计行不参与排序，永远置底）。
+	body := make([]modelStat, len(rows))
+	copy(body, rows)
+	sortModels(body, sortKey)
+
+	withTotal := len(body) > 1
+
+	// 列宽：表头与所有数据取最大显示宽度。
+	widths := make([]int, len(vis))
+	for i, c := range vis {
+		widths[i] = displayWidth(c.head)
+	}
+	measure := func(m modelStat) {
+		for i, c := range vis {
+			if w := displayWidth(c.value(m)); w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	for _, m := range body {
+		measure(m)
+	}
+	totalLabel := "合计"
+	if withTotal {
+		measure(total)
+		if w := displayWidth(totalLabel); w > widths[0] {
+			widths[0] = w
+		}
+	}
+
+	// 渲染一行：按列宽补齐。首列左对齐（模型名），其余右对齐（数字）。
+	renderRow := func(first string, m modelStat, firstOverride bool) string {
+		var b strings.Builder
+		for i, c := range vis {
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			var cell string
+			switch {
+			case i == 0 && firstOverride:
+				cell = first
+			default:
+				cell = c.value(m)
+			}
+			if c.right {
+				b.WriteString(padLeft(cell, widths[i]))
+			} else {
+				b.WriteString(padRight(cell, widths[i]))
+			}
+		}
+		return b.String()
+	}
+
+	// 表头。
+	heads := make([]col, len(vis))
+	copy(heads, vis)
+	var head strings.Builder
+	for i, c := range heads {
+		if i > 0 {
+			head.WriteByte(' ')
+		}
+		if c.right {
+			head.WriteString(padLeft(c.head, widths[i]))
+		} else {
+			head.WriteString(padRight(c.head, widths[i]))
+		}
+	}
+
+	sep := strings.Repeat("─", totalWidth(widths))
+
+	out := []string{head.String(), sep}
+	for _, m := range body {
+		out = append(out, renderRow("", m, false))
+	}
+	if withTotal {
+		out = append(out, sep, renderRow(totalLabel, total, true))
+	}
+	return out
+}
+
+// totalWidth 计算一行渲染后的总显示宽度（各列宽 + 列间单空格）。
+func totalWidth(widths []int) int {
+	n := 0
+	for i, w := range widths {
+		if i > 0 {
+			n++
+		}
+		n += w
+	}
+	return n
+}
+
+// buildFrame 组装完整帧（标题 + 表格 + 尾注），返回逐行切片。
+//
+// watch 与一次性快照共用此函数：两者内容完全一致，只是输出方式不同
+// （覆盖重绘 vs 顺序打印）。fetchErr 非 nil 时在帧内展示错误 —— watch 模式下
+// 错误若直接写 stderr 会冲乱已绘制的帧，且帧行数失配会导致覆盖错位。
+func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
+	var lines []string
+
+	title := "📈 网关请求统计"
+	if st != nil && st.UptimeSec > 0 {
+		title += " · 运行 " + humanDuration(time.Duration(st.UptimeSec)*time.Second)
+	}
+	lines = append(lines, title)
+	rule := strings.Repeat("─", displayWidth(title))
+
+	if fetchErr != nil {
+		// 帧内报错：保留标题与分隔线（帧结构稳定），错误信息作为表体。
+		return append(lines, rule, "⚠ "+fetchErr.Error())
+	}
+
 	if !st.Enabled {
 		msg := st.Message
 		if msg == "" {
 			msg = "请在网关配置中设置 server.metrics_enabled=true"
 		}
-		fmt.Printf("⚠ 网关未启用请求统计\n  %s\n", msg)
-		return nil
+		return append(lines, rule, "⚠ 网关未启用请求统计", "  "+msg)
 	}
 
-	printReport(st, sortKey)
-	return nil
+	if len(st.Models) == 0 {
+		return append(lines, rule, "暂无数据 —— 统计窗口内没有请求记录（-json 可取原始字段）")
+	}
+
+	table := buildTable(st.Models, st.Total, sortKey)
+	// 分隔线取表格自身宽度，与表格连成一体（标题那行可能有 emoji，宽度不必相同）。
+	lines = append(lines, strings.Repeat("─", displayWidth(table[0])))
+	lines = append(lines, table...)
+	return append(lines, "扣费单位=账号积分（非货币）· 完整字段见 -json")
 }
 
-// printReport 渲染人类可读快照。
-func printReport(st *statsResponse, sortKey string) {
-	t := st.Total
+// ─── 输出：一次性 vs 原地刷新 ─────────────────────────────────────────────
 
-	fmt.Printf("📈 网关请求统计")
-	if st.UptimeSec > 0 {
-		fmt.Printf("          运行 %s", humanDuration(time.Duration(st.UptimeSec)*time.Second))
-	}
-	fmt.Println()
-	fmt.Println(strings.Repeat("─", 66))
+// runWatch 原地刷新循环：每帧重绘覆盖上一帧。
+//
+// 覆盖方式不用全屏清屏（\033[2J）—— 那会闪屏且清掉滚动缓冲。改为相对移动
+// 光标回到帧首 + 逐行擦到行尾 + 帧尾清除多余旧行。tty 为 false（被重定向/
+// 无控制台）时回落为顺序打印，保证管道用法可读。
+func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, interval time.Duration, tty bool) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// ── 请求量 ──
-	successRate := 100.0
-	if t.Requests > 0 {
-		successRate = float64(t.Success) / float64(t.Requests) * 100
-	}
-	fmt.Printf("%-10s %-14s %-12s %s\n", "总请求", fmtInt(t.Requests),
-		fmt.Sprintf("成功 %.1f%%", successRate), fmt.Sprintf("流式 %s", fmtInt(t.Streaming)))
-	if t.Failed > 0 {
-		fmt.Printf("%-10s %s\n", "失败", fmtInt(t.Failed))
+	if tty {
+		fmt.Print("\033[?25l")       // 隐藏光标：避免其在重绘时跳动
+		defer fmt.Print("\033[?25h") // 恢复光标
 	}
 
-	// ── 性能 ── 首字与耗时是"有观测才有意义"的指标：无 usage 的请求不计入，
-	// 全为 0 时不必展示空行。
-	if t.AvgTTFBMS > 0 || t.AvgLatencyMS > 0 {
-		fmt.Printf("%-10s %-14s %-12s %s\n", "平均首字", fmtMillis(t.AvgTTFBMS),
-			fmt.Sprintf("耗时 %s", fmtMillis(t.AvgLatencyMS)),
-			fmt.Sprintf("吞吐 %s", fmtRate(t.TokensPerSec)))
-	}
+	prevLines := 0
+	for {
+		// 拉取失败且没有可用数据时，错误进帧内展示（而非 stderr），
+		// 保证帧结构的行数稳定、覆盖重绘不错位。
+		st, err := fetch(baseURL, apiKey, timeout)
+		var frame []string
+		if err != nil {
+			frame = buildFrame(&statsResponse{}, sortKey, err)
+		} else {
+			frame = buildFrame(st, sortKey, nil)
+		}
 
-	// ── token 与缓存 ──
-	if t.TotalTokens > 0 {
-		fmt.Printf("%-10s %-14s %s\n", "输入/输出",
-			fmt.Sprintf("%s / %s", fmtTokens(t.PromptTokens), fmtTokens(t.CompletionTokens)),
-			fmt.Sprintf("合计 %s", fmtTokens(t.TotalTokens)))
-		fmt.Printf("%-10s %.1f%%%s\n", "缓存命中", t.CacheHitRate*100,
-			fmt.Sprintf("        (命中 %s / 未命中 %s)", fmtTokens(t.CacheHitTokens), fmtTokens(t.CacheMissTokens)))
-	}
+		if tty {
+			rewriteFrame(frame, prevLines)
+		} else {
+			// 回落：每帧顺序打印，帧间空行分隔。
+			for _, l := range frame {
+				fmt.Println(l)
+			}
+			fmt.Println()
+		}
+		prevLines = len(frame)
 
-	// ── 成本 ── 扣费单位是账号积分，非货币。
-	if t.Credit > 0 || t.CreditPerReq > 0 {
-		fmt.Printf("%-10s %-14s %s\n", "累计扣费",
-			fmt.Sprintf("%.2f 积分", t.Credit),
-			fmt.Sprintf("每请求 %.4f", t.CreditPerReq))
-	}
-
-	// ── 按模型 ──
-	if len(st.Models) > 1 {
-		fmt.Println(strings.Repeat("─", 66))
-		fmt.Println("按模型")
-		printModelTable(st.Models, sortKey)
+		select {
+		case <-ctx.Done():
+			if tty {
+				// 退出前把光标移到帧尾下方，避免提示符接在帧内容后面。
+				fmt.Printf("\033[%dB\n", 1)
+			}
+			return 0
+		case <-time.After(interval):
+		}
 	}
 }
 
-// printModelTable 渲染按模型明细表。
-func printModelTable(models []modelStat, sortKey string) {
-	rows := make([]modelStat, len(models))
-	copy(rows, models)
-	sortModels(rows, sortKey)
-
-	fmt.Printf("  %-24s %7s %8s %10s %9s %10s\n", "模型", "请求", "首字", "吞吐", "缓存命中", "扣费")
-	for _, m := range rows {
-		name := m.Model
-		if len(name) > 24 {
-			name = name[:23] + "…"
-		}
-		ttfb := "-"
-		if m.AvgTTFBMS > 0 {
-			ttfb = fmtMillis(m.AvgTTFBMS)
-		}
-		tps := "-"
-		if m.TokensPerSec > 0 {
-			tps = fmtRate(m.TokensPerSec)
-		}
-		hit := "-"
-		if m.CacheHitTokens+m.CacheMissTokens > 0 {
-			hit = fmt.Sprintf("%.1f%%", m.CacheHitRate*100)
-		}
-		fmt.Printf("  %-24s %7s %8s %10s %9s %10s\n", name,
-			fmtInt(m.Requests), ttfb, tps, hit, fmt.Sprintf("%.2f", m.Credit))
+// rewriteFrame 覆盖重绘：回到帧首 → 逐行擦除写入 → 清除多余旧行。
+//
+// 帧内每行以 \r\n 结尾，故写完 M 行后光标停在第 M+1 行行首。下一帧据此上移
+// prevLines 行即可精确回到帧首；帧变短时多余旧行由帧尾的 \033[J 擦除。
+func rewriteFrame(lines []string, prevLines int) {
+	var b strings.Builder
+	if prevLines > 0 {
+		// 光标上移 prevLines 行，回到上一帧起点（列 0）。
+		fmt.Fprintf(&b, "\033[%dA", prevLines)
 	}
+	b.WriteString("\r")
+	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteString("\033[K") // 擦到行尾：覆盖时清掉上一帧更长的残留
+		b.WriteString("\r\n")
+	}
+	// 光标现在位于新帧下方一行的行首：此处到屏幕末尾的内容都是上一帧的残留
+	// （帧变短时）或空白，一并擦除。不移动光标，下一帧的上移量才与行数吻合。
+	b.WriteString("\033[J")
+	_, _ = os.Stdout.WriteString(b.String())
+}
+
+// ─── CJK 宽度感知的补齐与截断 ─────────────────────────────────────────────
+//
+// Go 的 fmt 宽度按 rune 计数，而中文/全角字符占 2 个显示列，直接用
+// %-10s 会让含中文的行比其他行窄，表头与数据逐列错位。故自行按显示宽度补齐。
+
+// displayWidth 返回字符串在等宽终端中占用的显示列数。
+//
+// 判定：东亚宽度为 Wide/Fullwidth 的字符（CJK 汉字、全角标点、全角字母等）
+// 占 2 列；其余（含 ASCII、Latin-1、半角片假名）占 1 列。
+// 组合附加符（零宽）与 emoji 的精确宽度因终端而异，此处按 1 列近似 —— 本工具
+// 只在标题用 emoji（左对齐、不参与列对齐），因此不影响表格对齐。
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		w += runeWidth(r)
+	}
+	return w
+}
+
+// runeWidth 返回单个 rune 的显示宽度（1 或 2）。
+func runeWidth(r rune) int {
+	// 零宽：组合附加符号、变体选择符。
+	if r == 0x200B || (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0x0300 && r <= 0x036F) {
+		return 0
+	}
+	if isWide(r) {
+		return 2
+	}
+	return 1
+}
+
+// isWide 报告 rune 是否属于东亚"宽/全角"区间（占 2 列）。
+//
+// 区间依据 Unicode East Asian Width 属性的 W 与 F 类，覆盖常用范围；
+// 不追求穷尽所有生僻区块（模型名与表头都用不到），但覆盖 CJK、全角标点、
+// 谚文、假名、以及常见 symbol 区块。
+func isWide(r rune) bool {
+	switch {
+	case r < 0x1100:
+		return false // ASCII 与拉丁扩展：全部窄
+	}
+	return (r >= 0x1100 && r <= 0x115F) || // 谚文字母
+		r == 0x2329 || r == 0x232A || // 〈 〉
+		(r >= 0x2E80 && r <= 0x303E) || // CJK 部首、康熙部首、CJK 符号标点
+		(r >= 0x3041 && r <= 0x33FF) || // 平假名、片假名、CJK 兼容、注音
+		(r >= 0x3400 && r <= 0x4DBF) || // CJK 扩展 A
+		(r >= 0x4E00 && r <= 0x9FFF) || // CJK 基本区
+		(r >= 0xA000 && r <= 0xA4CF) || // 彝文
+		(r >= 0xAC00 && r <= 0xD7A3) || // 谚文音节
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK 兼容表意文字
+		(r >= 0xFE30 && r <= 0xFE6F) || // CJK 兼容形式、小写变体
+		(r >= 0xFF00 && r <= 0xFF60) || // 全角 ASCII
+		(r >= 0xFFE0 && r <= 0xFFE6) || // 全角符号
+		(r >= 0x1F300 && r <= 0x1F64F) || // 杂项符号与绘文字（近似按 2 列）
+		(r >= 0x1F900 && r <= 0x1F9FF) || // 补充符号与绘文字
+		(r >= 0x20000 && r <= 0x3FFFD) // CJK 扩展 B 及以后
+}
+
+// padRight 左对齐补齐到 width 显示列。
+func padRight(s string, width int) string {
+	if d := width - displayWidth(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
+}
+
+// padLeft 右对齐补齐到 width 显示列。
+func padLeft(s string, width int) string {
+	if d := width - displayWidth(s); d > 0 {
+		return strings.Repeat(" ", d) + s
+	}
+	return s
+}
+
+// truncateWidth 把字符串截断到不超过 max 显示列，超出加省略号。
+// 中文按 2 列计，因此同一 max 下中文能放的字符数比英文少一半。
+func truncateWidth(s string, max int) string {
+	if displayWidth(s) <= max {
+		return s
+	}
+	const ellipsis = "…" // 占 2 列
+	budget := max - displayWidth(ellipsis)
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := runeWidth(r)
+		if used+w > budget {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String() + ellipsis
 }
 
 // sortModels 按 sortKey 降序排列；无法识别时退回请求数。
