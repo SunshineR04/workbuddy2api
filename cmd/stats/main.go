@@ -73,6 +73,7 @@ func main() {
 		sortKey  = flag.String("sort", "requests", "按模型排序字段：requests|ttfb|tokens|credit")
 		width    = flag.Int("width", 0, "按指定列宽排版（0 = 自动探测终端宽度）")
 		height   = flag.Int("height", 0, "按指定行数排版（0 = 自动探测终端高度）")
+		altScr   = flag.Bool("alt-screen", false, "watch 用备用屏幕缓冲绘制（退出时还原原屏，推荐）")
 		showHelp = flag.Bool("h", false, "显示帮助")
 	)
 	flag.Usage = func() {
@@ -106,7 +107,7 @@ func main() {
 
 	if *watch > 0 {
 		// 备用屏只在真有控制台时启用：管道/重定向下那串转义会污染输出。
-		os.Exit(runWatch(baseURL, apiKey, *timeout, *sortKey, *watch, tty, lay))
+		os.Exit(runWatch(baseURL, apiKey, *timeout, *sortKey, *watch, tty, *altScr && tty, lay))
 	}
 
 	if err := renderOnce(baseURL, apiKey, *timeout, *jsonOut, *sortKey, lay); err != nil {
@@ -812,25 +813,72 @@ func frameNow(st *statsResponse) time.Time {
 
 // ─── 输出：一次性 vs 原地刷新 ─────────────────────────────────────────────
 
+// 备用屏幕缓冲（alternate screen）的进入/退出序列。
+//
+// 用它绘制等于"另开一块画布"：不污染用户原有的屏幕与滚动缓冲，退出时原样恢复
+// —— 与 htop / less / vim 同款做法。这让"刷新过程中缩放窗口"从根上安全：
+// 备用屏里没有历史内容会被弄乱。
+const (
+	altScreenEnter = "\033[?1049h"
+	altScreenLeave = "\033[?1049l"
+)
+
+// clearScreen 清屏并把光标移到左上角，用于**重建绘制基线**。
+//
+// 为什么必须能重建：原地覆盖靠相对上移（\033[NA）回到帧首，而这只在"上一帧
+// 在当前窗口下的视觉行数 == 逻辑行数"时才成立。窗口尺寸一变（用户缩小命令行），
+// 旧帧内容会在新宽度下**折行**，视觉行数多于逻辑行数，上移量随即失准 ——
+// 新旧帧叠在一起，越刷越乱。缩窄窗口后"根本没法看"就是这个原因。
+//
+// 把基线重置为"屏幕左上角"，与旧帧的实际占用无关，因此必然正确。
+// 只在尺寸变化时调用（不是每帧），故不会闪屏。
+//
+// **刻意不用 ED(2)（\033[2J）**：Windows conhost 把"清屏"实现成"把当前屏幕
+// 内容滚入滚动缓冲"（即 cls 的行为）。于是每重建一次基线，就往回滚历史里留
+// 一份完整表格 —— 用户调整几次窗口大小，scrollback 里就叠几份表（实测 4 次
+// 缩放 = 4 份），表现为"太占用命令行上下文窗口"。
+//
+// 改用 ED(0)（\033[J，只擦光标**之后**）+ 显式归位：擦除不产生新历史，配合
+// rewriteFrame 的逐行 \033[K（擦到行尾）与帧尾 \033[J，可视区被完整覆盖 ——
+// 既无残留，也不污染 scrollback。
+func clearScreen() {
+	_, _ = os.Stdout.WriteString("\033[H\033[J")
+}
+
 // runWatch 原地刷新循环：每帧重绘覆盖上一帧。
 //
-// 覆盖方式不用全屏清屏（\033[2J）—— 那会闪屏且清掉滚动缓冲。改为相对移动
-// 光标回到帧首 + 逐行擦到行尾 + 帧尾清除多余旧行。tty 为 false（被重定向/
-// 无控制台）时回落为顺序打印，保证管道用法可读。
+// 覆盖方式不用每帧全屏清屏（\033[2J）—— 那会闪屏。改为相对移动光标回到帧首
+// + 逐行擦到行尾 + 帧尾清除多余旧行。唯一的例外是**终端尺寸变化**：此时相对
+// 上移不再可信，改为清屏重建基线（见 clearScreen）。
+//
+// tty 为 false（被重定向/无控制台）时回落为顺序打印，保证管道用法可读。
+//
+// altScreen 为 true 时使用备用屏幕缓冲：绘制不落在用户的滚动缓冲里，退出时
+// 整屏还原。它让缩放窗口这件事更安全，也让 live 视图更干净。
 //
 // 尺寸每轮重新探测：终端窗口（尤其分屏）随时可能被拖动改变，用旧尺寸排版会
 // 让帧再次超出可视区。
-func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, interval time.Duration, tty bool, lay layout) int {
+func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, interval time.Duration, tty, altScreen bool, lay layout) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if tty {
-		fmt.Print("\033[?25l")       // 隐藏光标：避免其在重绘时跳动
-		defer fmt.Print("\033[?25h") // 恢复光标
+		fmt.Print("\033[?25l") // 隐藏光标：避免其在重绘时跳动
+		defer fmt.Print("\033[?25h")
+		if altScreen {
+			fmt.Print(altScreenEnter)
+			defer fmt.Print(altScreenLeave)
+		}
 	}
 
 	prevLines := 0
 	overlap := true // 上一帧是否以"原地覆盖"方式绘制（决定本轮能否上移光标）
+
+	// drawnW/drawnH 记录上一帧**绘制时**的排版尺寸（0 = 尚未绘制）。用于识别
+	// "尺寸变了"：一旦变化，旧帧在当前窗口下的视觉占用行数就不再等于 len(frame)，
+	// 相对上移必然失准，必须清屏重建基线而不能硬移光标。
+	drawnW, drawnH := 0, 0
+
 	for {
 		// 拉取失败且没有可用数据时，错误进帧内展示（而非 stderr），
 		// 保证帧结构的行数稳定、覆盖重绘不错位。
@@ -846,9 +894,16 @@ func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, int
 		// 例如只有十几列），原地覆盖必然错位 —— 此时退回滚动输出，宁可刷屏
 		// 也不要内容互相覆盖成乱码。
 		fits := frameFits(frame, lay)
-		if tty && fits {
+		sizeChanged := drawnW != 0 && (drawnW != lay.width || drawnH != lay.height)
+
+		switch {
+		case tty && fits && sizeChanged:
+			// 尺寸变了：旧帧的视觉行数已不可知，相对上移会叠帧。清屏重建基线。
+			clearScreen()
+			rewriteFrame(frame, 0, false)
+		case tty && fits:
 			rewriteFrame(frame, prevLines, overlap)
-		} else {
+		default:
 			// 回落：顺序打印，帧间空行分隔。用 prevLines=0 通知下一帧不要上移
 			// 光标 —— 本轮内容是被推上去的，位置与上一帧的记账不符。
 			for _, l := range frame {
@@ -857,15 +912,18 @@ func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, int
 			fmt.Println()
 			overlap = false
 		}
+
 		prevLines = len(frame)
 		if tty && fits {
 			overlap = true
+			drawnW, drawnH = lay.width, lay.height
 		}
 
 		select {
 		case <-ctx.Done():
-			if tty && overlap {
-				// 退出前把光标移到帧尾下方，避免提示符接在帧内容后面。
+			// 退出前把光标移到帧尾下方，避免提示符接在帧内容后面。
+			// 用备用屏时不必：退出备用屏会整屏还原。
+			if tty && overlap && !altScreen {
 				fmt.Printf("\033[%dB\n", 1)
 			}
 			return 0

@@ -23,8 +23,8 @@ import (
 // 只实现被回放到的序列（光标上移/下移、回车、换行、擦到行尾、擦到屏尾、
 // 光标显隐）；未识别的序列直接丢弃。
 type screen struct {
-	cells [][]rune  // 每行的 rune 序列
-	widths [][]int  // 与 cells 对应的显示宽度
+	cells    [][]rune // 每行的 rune 序列
+	widths   [][]int  // 与 cells 对应的显示宽度
 	row, col int
 	// pendingWrap 模拟"写在末列后终端置位待折行"：置位时再来一个可打印字符
 	// 才真正换行。conhost 与 xterm 都如此，是本 bug 的成因之一。
@@ -101,13 +101,74 @@ func (s *screen) eraseToEnd() {
 	s.pendingWrap = false
 }
 
-// eraseToScreenEnd 擦除从光标处到屏幕末尾的所有内容。
+// eraseToScreenEnd 擦除从光标处到屏幕末尾的所有内容（对应 \033[J）。
 func (s *screen) eraseToScreenEnd() {
 	s.eraseToEnd()
 	if s.row+1 < len(s.cells) {
 		s.cells = s.cells[:s.row+1]
 		s.widths = s.widths[:s.row+1]
 	}
+}
+
+// eraseAll 清空整屏（对应 \033[2J）—— 与光标位置无关。
+func (s *screen) eraseAll() {
+	s.cells = nil
+	s.widths = nil
+	s.pendingWrap = false
+}
+
+// home 把光标移到左上角（对应 \033[H）。
+func (s *screen) home() {
+	s.row, s.col = 0, 0
+	s.pendingWrap = false
+}
+
+// resize 改变模型窗口宽度，并**模拟真实终端的重排**：已画出的内容会按新宽度
+// 重新折行（这正是缩小窗口后旧帧"视觉行数"暴涨、相对上移失准的根源）。
+//
+// 若不模拟重排，屏幕模型就测不出这个 bug —— 这也是它此前漏判的原因。
+//
+// 关键细节：重排后**光标停在内容的末尾**（而不是回到左上角）。真实终端里光标
+// 是跟着文本走的：窗口缩窄使文本折行变长后，光标仍在最后一行。若这里把光标
+// 归零，`\033[NA` 会因越界被钳到顶行，于是"上移不到位"被掩盖成"恰好重画"，
+// 反证用例就会假通过（实测踩过这个坑）。
+func (s *screen) resize(width int) {
+	if width == s.width || width <= 0 {
+		s.width = width
+		return
+	}
+	// 把现有内容按逻辑行取出，再按新宽度硬折行重建。
+	var logical []string
+	for i := range s.cells {
+		logical = append(logical, s.line(i))
+	}
+	s.width = width
+	s.cells, s.widths = nil, nil
+	s.row, s.col, s.pendingWrap = 0, 0, false
+	for _, l := range logical {
+		if l == "" {
+			s.row++
+			s.col = 0
+			continue
+		}
+		col := 0
+		for _, r := range l {
+			w := runeWidth(r)
+			if col+w > width { // 折行：终端把放不下的部分挪到下一行
+				s.row++
+				s.col = 0
+				col = 0
+			}
+			s.col = col
+			s.put(r, w)
+			col += w
+		}
+		s.row++
+		s.col = 0
+	}
+	// 光标留在内容末尾（最后一行行首），与真实终端一致。
+	s.col = 0
+	s.pendingWrap = false
 }
 
 // write 回放一段带转义序列的输出。
@@ -131,13 +192,23 @@ func (s *screen) write(b string) {
 				}
 				s.pendingWrap = false
 			case 'B': // 光标下移
-				s.row += atoiDefault(params, 1)
+				n := atoiDefault(params, 1)
+				s.row += n
 				s.pendingWrap = false
+			case 'H': // 光标归位（左上角）
+				s.home()
+			case 'J': // 擦除：参数 2 = 整屏，其余 = 光标到屏尾
+				// 注意：\033[2J 只擦内容，**不移动光标**（真实终端语义）。
+				// 归位要靠单独的 \033[H。若这里顺手把光标归零，就会掩盖
+				// "清屏后忘了归位"这类缺陷（实测踩过这个坑）。
+				if strings.TrimPrefix(params, "?") == "2" {
+					s.eraseAll()
+				} else {
+					s.eraseToScreenEnd()
+				}
 			case 'K': // 擦到行尾
 				s.eraseToEnd()
-			case 'J': // 擦到屏尾
-				s.eraseToScreenEnd()
-			case 'h', 'l': // 光标显隐：不影响内容
+			case 'h', 'l': // 光标显隐 / 备用屏切换：不影响本模型的单元格内容
 			}
 			i = j + 1
 			continue
