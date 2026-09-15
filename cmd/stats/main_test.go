@@ -207,7 +207,7 @@ func TestRenderDisabled(t *testing.T) {
 	defer srv.Close()
 
 	out := captureStdout(t, func() {
-		if err := renderOnce(srv.URL, "k", 5*time.Second, false, "requests"); err != nil {
+		if err := renderOnce(srv.URL, "k", 5*time.Second, false, "requests", layout{}); err != nil {
 			t.Errorf("renderOnce: %v", err)
 		}
 	})
@@ -227,7 +227,7 @@ func TestRenderNoData(t *testing.T) {
 	defer srv.Close()
 
 	out := captureStdout(t, func() {
-		if err := renderOnce(srv.URL, "k", 5*time.Second, false, "requests"); err != nil {
+		if err := renderOnce(srv.URL, "k", 5*time.Second, false, "requests", layout{}); err != nil {
 			t.Errorf("renderOnce: %v", err)
 		}
 	})
@@ -249,7 +249,7 @@ func TestRenderJSONPassesThrough(t *testing.T) {
 	defer srv.Close()
 
 	out := captureStdout(t, func() {
-		if err := renderOnce(srv.URL, "k", 5*time.Second, true, "requests"); err != nil {
+		if err := renderOnce(srv.URL, "k", 5*time.Second, true, "requests", layout{}); err != nil {
 			t.Errorf("renderOnce: %v", err)
 		}
 	})
@@ -304,7 +304,7 @@ func mkModel(name string, req int64, failed int64) modelStat {
 // TestTableSingleModelNoTotalRow 单模型时不出现合计行 —— 那一行本身就是汇总。
 func TestTableSingleModelNoTotalRow(t *testing.T) {
 	rows := []modelStat{mkModel("deepseek-v4.1-flash", 131, 0)}
-	table := buildTable(rows, mkModel("(all)", 131, 0), "requests")
+	table := buildTable(rows, mkModel("(all)", 131, 0), "requests", 0, 0)
 
 	joined := strings.Join(table, "\n")
 	if strings.Contains(joined, "合计") {
@@ -319,7 +319,7 @@ func TestTableSingleModelNoTotalRow(t *testing.T) {
 // TestTableMultiModelHasTotalRow 多模型时出现分隔线 + 合计行。
 func TestTableMultiModelHasTotalRow(t *testing.T) {
 	rows := []modelStat{mkModel("a", 131, 0), mkModel("b", 70, 0)}
-	table := buildTable(rows, mkModel("(all)", 201, 0), "requests")
+	table := buildTable(rows, mkModel("(all)", 201, 0), "requests", 0, 0)
 
 	joined := strings.Join(table, "\n")
 	if !strings.Contains(joined, "合计") {
@@ -334,12 +334,12 @@ func TestTableMultiModelHasTotalRow(t *testing.T) {
 // TestTableFailedColumnHidden 全部成功时不出现失败列（常态下省 4 列宽度）；
 // 任一模型有失败则出现。
 func TestTableFailedColumnHidden(t *testing.T) {
-	noFail := buildTable([]modelStat{mkModel("a", 10, 0)}, mkModel("(all)", 10, 0), "requests")
+	noFail := buildTable([]modelStat{mkModel("a", 10, 0)}, mkModel("(all)", 10, 0), "requests", 0, 0)
 	if strings.Contains(strings.Join(noFail, "\n"), "失败") {
 		t.Errorf("无失败时不应出现失败列:\n%s", strings.Join(noFail, "\n"))
 	}
 
-	withFail := buildTable([]modelStat{mkModel("a", 10, 2)}, mkModel("(all)", 10, 2), "requests")
+	withFail := buildTable([]modelStat{mkModel("a", 10, 2)}, mkModel("(all)", 10, 2), "requests", 0, 0)
 	if !strings.Contains(strings.Join(withFail, "\n"), "失败") {
 		t.Errorf("有失败时应出现失败列:\n%s", strings.Join(withFail, "\n"))
 	}
@@ -357,7 +357,7 @@ func TestTableColumnsAligned(t *testing.T) {
 		{mkModel("x", 0, 0)}, // 全零行：占位符也要保持等宽
 	}
 	for i, rows := range cases {
-		tbl := buildTable(rows, mkModel("(all)", 131, 0), "requests")
+		tbl := buildTable(rows, mkModel("(all)", 131, 0), "requests", 0, 0)
 		want := displayWidth(tbl[0])
 		for j, line := range tbl {
 			if got := displayWidth(line); got != want {
@@ -373,7 +373,7 @@ func TestTableColumnsAligned(t *testing.T) {
 // 不同（如 + 比 | 多占一列）同样会错位。故按显示列逐一比对。
 func TestTableSeparatorAlignsBars(t *testing.T) {
 	rows := []modelStat{mkModel("a", 131, 0), mkModel("中文模型名较长", 70, 3)}
-	tbl := buildTable(rows, mkModel("(all)", 201, 3), "requests")
+	tbl := buildTable(rows, mkModel("(all)", 201, 3), "requests", 0, 0)
 
 	// 找出所有含竖线的行（表头与每个数据行），以及所有分隔线行。
 	var dataLines, sepLines []string
@@ -405,7 +405,7 @@ func TestTableSeparatorAlignsBars(t *testing.T) {
 // TestTableSeparatorWidthMatchesRows 分隔线与数据行等宽（TestTableColumnsAligned
 // 已覆盖等宽，此处单独断言以便失败信息更直白）。
 func TestTableSeparatorWidthMatchesRows(t *testing.T) {
-	tbl := buildTable([]modelStat{mkModel("m", 5, 0)}, mkModel("(all)", 5, 0), "requests")
+	tbl := buildTable([]modelStat{mkModel("m", 5, 0)}, mkModel("(all)", 5, 0), "requests", 0, 0)
 	if len(tbl) < 3 {
 		t.Fatalf("表至少应有表头+分隔线+1 行，得到 %d 行", len(tbl))
 	}
@@ -420,7 +420,7 @@ func TestTableSeparatorWidthMatchesRows(t *testing.T) {
 // U+2500 的 East Asian Width 是 Ambiguous：终端可按 1 或 2 列渲染，导致
 // 分隔线与表格对不齐（这正是改用 ASCII 的原因）。故断言分隔线字符集。
 func TestTableUsesOnlyASCIIBorder(t *testing.T) {
-	tbl := buildTable([]modelStat{mkModel("m", 5, 0), mkModel("n", 7, 0)}, mkModel("(all)", 12, 0), "requests")
+	tbl := buildTable([]modelStat{mkModel("m", 5, 0), mkModel("n", 7, 0)}, mkModel("(all)", 12, 0), "requests", 0, 0)
 	for _, l := range tbl {
 		for _, r := range l {
 			if r > 0x7F {
@@ -509,7 +509,7 @@ func TestBuildFrameStructure(t *testing.T) {
 		Total:  mkModel("(all)", 131, 0),
 		Models: []modelStat{mkModel("deepseek-v4.1-flash", 131, 0)},
 	}
-	frame := buildFrame(st, "requests", nil)
+	frame := buildFrame(st, "requests", nil, layout{})
 
 	if !strings.Contains(frame[0], "网关请求统计") {
 		t.Errorf("首行应为标题，得到 %q", frame[0])
@@ -545,7 +545,7 @@ func TestBuildFrameTitleWithoutSince(t *testing.T) {
 			Total:  mkModel("(all)", 1, 0),
 			Models: []modelStat{mkModel("m", 1, 0)},
 		}
-		frame := buildFrame(st, "requests", nil)
+		frame := buildFrame(st, "requests", nil, layout{})
 		if !strings.Contains(frame[0], "窗口 1h0m") {
 			t.Errorf("since=%q 时仍应显示窗口时长，得到 %q", since, frame[0])
 		}
@@ -558,7 +558,7 @@ func TestBuildFrameTitleWithoutSince(t *testing.T) {
 // TestBuildFrameFetchError 拉取失败时错误进帧内（而非 stderr），
 // 且帧结构仍成立 —— watch 模式依赖行数稳定才不覆盖错位。
 func TestBuildFrameFetchError(t *testing.T) {
-	frame := buildFrame(&statsResponse{}, "requests", fmt.Errorf("连接网关失败（http://x）: refused"))
+	frame := buildFrame(&statsResponse{}, "requests", fmt.Errorf("连接网关失败（http://x）: refused"), layout{})
 	joined := strings.Join(frame, "\n")
 	if !strings.Contains(joined, "连接网关失败") {
 		t.Errorf("错误应出现在帧内:\n%s", joined)
@@ -570,7 +570,7 @@ func TestBuildFrameFetchError(t *testing.T) {
 
 // TestBuildFrameNoData models 为空时提示，且不产生表格。
 func TestBuildFrameNoData(t *testing.T) {
-	frame := buildFrame(&statsResponse{Enabled: true, UptimeSec: 5}, "requests", nil)
+	frame := buildFrame(&statsResponse{Enabled: true, UptimeSec: 5}, "requests", nil, layout{})
 	joined := strings.Join(frame, "\n")
 	if !strings.Contains(joined, "暂无数据") {
 		t.Errorf("应提示暂无数据:\n%s", joined)
@@ -598,7 +598,7 @@ func TestValidateFlags(t *testing.T) {
 func TestRewriteFrameEscapes(t *testing.T) {
 	// 第二帧（上一帧 5 行，本帧 3 行）：
 	lines := []string{"a", "b", "c"}
-	got := captureStdout(t, func() { rewriteFrame(lines, 5) })
+	got := captureStdout(t, func() { rewriteFrame(lines, 5, true) })
 
 	if !strings.HasPrefix(got, "\033[5A") {
 		n := len(got)
@@ -618,7 +618,7 @@ func TestRewriteFrameEscapes(t *testing.T) {
 	}
 
 	// 首帧（prevLines=0）不应上移光标 —— 否则会吃掉已有输出。
-	first := captureStdout(t, func() { rewriteFrame(lines, 0) })
+	first := captureStdout(t, func() { rewriteFrame(lines, 0, true) })
 	if strings.Contains(first, "[0A") {
 		t.Errorf("首帧不应包含上移转义，得到 %q", first)
 	}

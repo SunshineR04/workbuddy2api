@@ -71,6 +71,8 @@ func main() {
 		watch    = flag.Duration("watch", 0, "原地刷新间隔（如 5s）；0 = 只取一次快照")
 		timeout  = flag.Duration("timeout", 15*time.Second, "HTTP 请求超时")
 		sortKey  = flag.String("sort", "requests", "按模型排序字段：requests|ttfb|tokens|credit")
+		width    = flag.Int("width", 0, "按指定列宽排版（0 = 自动探测终端宽度）")
+		height   = flag.Int("height", 0, "按指定行数排版（0 = 自动探测终端高度）")
 		showHelp = flag.Bool("h", false, "显示帮助")
 	)
 	flag.Usage = func() {
@@ -100,14 +102,35 @@ func main() {
 	// 不可用时 watch 回落为逐帧滚动输出（仍有完整内容，只是不覆盖）。
 	tty := enableVT()
 
+	lay := resolveLayout(*width, *height)
+
 	if *watch > 0 {
-		os.Exit(runWatch(baseURL, apiKey, *timeout, *sortKey, *watch, tty))
+		os.Exit(runWatch(baseURL, apiKey, *timeout, *sortKey, *watch, tty, lay))
 	}
 
-	if err := renderOnce(baseURL, apiKey, *timeout, *jsonOut, *sortKey); err != nil {
+	if err := renderOnce(baseURL, apiKey, *timeout, *jsonOut, *sortKey, lay); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// resolveLayout 决定渲染区域：显式 -width/-height 优先，否则探测终端尺寸。
+//
+// 探测不到（重定向/管道）时该维度保持 0，表示不限制 —— 管道场景没有"折行"
+// 问题（无终端排版），应输出完整内容而不是按未知尺寸裁剪。
+func resolveLayout(width, height int) layout {
+	lay := layout{pinW: width > 0, pinH: height > 0, width: width, height: height}
+	if lay.pinW && lay.pinH {
+		return lay
+	}
+	cols, rows := termSize()
+	if !lay.pinW {
+		lay.width = usableWidth(cols)
+	}
+	if !lay.pinH {
+		lay.height = rows
+	}
+	return lay
 }
 
 // validateFlags 校验参数组合。单独成函数便于测试（main 直接 os.Exit）。
@@ -191,7 +214,7 @@ func fetch(baseURL, apiKey string, timeout time.Duration) (*statsResponse, error
 	return &out, nil
 }
 
-func renderOnce(baseURL, apiKey string, timeout time.Duration, jsonOut bool, sortKey string) error {
+func renderOnce(baseURL, apiKey string, timeout time.Duration, jsonOut bool, sortKey string, lay layout) error {
 	st, err := fetch(baseURL, apiKey, timeout)
 	if err != nil {
 		return err
@@ -206,7 +229,7 @@ func renderOnce(baseURL, apiKey string, timeout time.Duration, jsonOut bool, sor
 		return nil
 	}
 
-	for _, line := range buildFrame(st, sortKey, nil) {
+	for _, line := range buildFrame(st, sortKey, nil, lay) {
 		fmt.Println(line)
 	}
 	return nil
@@ -218,27 +241,46 @@ func renderOnce(baseURL, apiKey string, timeout time.Duration, jsonOut bool, sor
 // （仅多模型时出现；单模型时那一行本身就是汇总，重复展示没有信息量）。
 // 失败列按需出现：全部成功时不占位，一旦有失败自动出现以引起注意。
 
-// col 定义一列：表头、取值、对齐、是否在生成表头时提供。
+// col 定义一列：表头、取值、对齐、显隐、让位次序。
 //
 // show 为 nil 表示恒显示；否则由 buildTable 依据整表数据决定是否纳入该列。
+// truncate > 0 表示取值超过该显示宽度时截断（仅模型列需要，且窗口过窄时会
+// 被进一步压低到 modelMinWidth）。
+// keep 为 true 的列在窗口过窄时也不裁剪 —— 模型/请求/失败丢了表格就没意义；
+// 其余列按 dropSeq 从小到大依次让位（数值越大越重要，越晚被裁）。
 type col struct {
-	head  string
-	value func(modelStat) string
-	right bool
-	show  func(rows []modelStat) bool
+	head     string
+	value    func(modelStat) string
+	right    bool
+	show     func(rows []modelStat) bool
+	keep     bool
+	truncate int
+	dropSeq  int
 }
 
-// columns 返回列定义。顺序即渲染顺序。
+// modelMinWidth 是模型列可被压缩到的下限（显示列）。
+// 再窄就连 "cn:deepseek…" 这类前缀都区分不出，不如不压。
+const modelMinWidth = 12
+
+// modelNameMaxWidth 是模型列在窗口充裕时的最大宽度（显示列）。
+const modelNameMaxWidth = 28
+
+// columns 返回列定义。顺序即渲染顺序；modelBudget 为模型列的截断宽度。
 //
 // 失败列用 show 回调：只要任一行的失败数非 0（含合计行）才纳入，
 // 避免常态下白白占 4 列宽度。
-func columns() []col {
+//
+// keep / dropSeq 决定窗口过窄时的让位次序：keep 列永不裁剪（模型、请求、失败
+// 丢了表格就失去意义），其余列按 dropSeq 从小到大依次让位 —— 序小者先走。
+// 排序依据是"信息价值 ÷ 宽度"：缓存命中、输入/输出 这类既宽又偏诊断性的先让位；
+// 扣费（等于钱）虽窄也留到最后。
+func columns(modelBudget int) []col {
 	return []col{
-		{head: "模型", value: func(m modelStat) string {
-			return truncateWidth(m.Model, 28)
+		{head: "模型", keep: true, truncate: modelBudget, value: func(m modelStat) string {
+			return truncateWidth(m.Model, modelBudget)
 		}},
-		{head: "请求", right: true, value: func(m modelStat) string { return fmtInt(m.Requests) }},
-		{head: "失败", right: true, value: func(m modelStat) string { return fmtInt(m.Failed) },
+		{head: "请求", right: true, keep: true, value: func(m modelStat) string { return fmtInt(m.Requests) }},
+		{head: "失败", right: true, keep: true, value: func(m modelStat) string { return fmtInt(m.Failed) },
 			show: func(rows []modelStat) bool {
 				for _, m := range rows {
 					if m.Failed > 0 {
@@ -247,23 +289,23 @@ func columns() []col {
 				}
 				return false
 			}},
-		{head: "首字", right: true, value: func(m modelStat) string { return fmtMillis(m.AvgTTFBMS) }},
-		{head: "耗时", right: true, value: func(m modelStat) string { return fmtMillis(m.AvgLatencyMS) }},
-		{head: "吞吐", right: true, value: func(m modelStat) string { return fmtRate(m.TokensPerSec) }},
-		{head: "输入/输出", right: true, value: func(m modelStat) string {
+		{head: "首字", right: true, dropSeq: 5, value: func(m modelStat) string { return fmtMillis(m.AvgTTFBMS) }},
+		{head: "耗时", right: true, dropSeq: 4, value: func(m modelStat) string { return fmtMillis(m.AvgLatencyMS) }},
+		{head: "吞吐", right: true, dropSeq: 3, value: func(m modelStat) string { return fmtRate(m.TokensPerSec) }},
+		{head: "输入/输出", right: true, dropSeq: 2, value: func(m modelStat) string {
 			// 无 usage 观测时（无 token 数据）显示占位符，不显示 0/0 误导。
 			if m.PromptTokens == 0 && m.CompletionTokens == 0 {
 				return "-"
 			}
 			return fmtTokens(m.PromptTokens) + "/" + fmtTokens(m.CompletionTokens)
 		}},
-		{head: "缓存命中", right: true, value: func(m modelStat) string {
+		{head: "缓存命中", right: true, dropSeq: 1, value: func(m modelStat) string {
 			if m.CacheHitTokens+m.CacheMissTokens == 0 {
 				return "-"
 			}
 			return fmt.Sprintf("%.1f%%", m.CacheHitRate*100)
 		}},
-		{head: "扣费", right: true, value: func(m modelStat) string {
+		{head: "扣费", right: true, dropSeq: 6, value: func(m modelStat) string {
 			return fmt.Sprintf("%.2f", m.Credit)
 		}},
 	}
@@ -283,28 +325,107 @@ func columns() []col {
 //
 // 列宽取表头与该列所有取值中的最大显示宽度（CJK 按 2 列计），因此中文表头
 // 不会把后续列挤偏。
-func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
-	cols := columns()
-
-	// 失败列的显隐要考虑合计行：明细全 0 但合计非 0 在数学上不可能，
-	// 但显式纳入可让边界（如部分模型缺数据）行为可预期。
-	vis := make([]col, 0, len(cols))
-	probe := append(append([]modelStat(nil), rows...), total)
-	for _, c := range cols {
-		if c.show == nil || c.show(probe) {
-			vis = append(vis, c)
-		}
-	}
-
+//
+// maxWidth 为可用显示宽度（<=0 表示不限）：超宽时先按 dropSeq 淘汰最不重要的列，
+// 再压缩模型列，直到放得下。窗口过窄时必须裁剪 —— 一旦表格宽于窗口，终端会把
+// 一行折成两行，watch 的"上移 N 行"就会错位并堆叠。
+//
+// maxRows 为表格可用的总行数（<=0 表示不限，含表头/分隔线/合计行）：超出时保留
+// 头部若干行，其余折叠为一行"…另有 N 个模型"提示。高度同样必须约束 —— 帧高于
+// 窗口时首行会被顶出可视区，watch 回不到帧首。
+func buildTable(rows []modelStat, total modelStat, sortKey string, maxWidth, maxRows int) []string {
 	// 排序后的明细（合计行不参与排序，永远置底）。
 	body := make([]modelStat, len(rows))
 	copy(body, rows)
 	sortModels(body, sortKey)
 
 	withTotal := len(body) > 1
-	totalLabel := "合计"
+	const totalLabel = "合计"
 
-	// 列宽：表头与所有数据取最大显示宽度。
+	// 高度裁剪：表头+分隔线+（合计时再多一条分隔线与合计行）是固定开销，
+	// 余下才是明细可用的行数。折叠提示本身要占一行，故预留。
+	folded := 0
+	if maxRows > 0 {
+		fixed := 2 // 表头 + 分隔线
+		if withTotal {
+			fixed += 2 // 分隔线 + 合计行
+		}
+		avail := maxRows - fixed
+		if avail < 1 {
+			avail = 1
+		}
+		if len(body) > avail {
+			// avail 行里最后一行让给折叠提示（"…另有 N 个"），故明细留 avail-1 行；
+			// 只够一行时优先显示明细本身，提示让位。
+			keep := avail - 1
+			if keep < 1 {
+				keep = 1
+			}
+			folded = len(body) - keep
+			body = body[:keep]
+		}
+	}
+
+	// 失败列的显隐要考虑合计行：明细全 0 但合计非 0 在数学上不可能，
+	// 但显式纳入可让边界（如部分模型缺数据）行为可预期。
+	all := columns(modelNameMaxWidth)
+	probe := append(append([]modelStat(nil), body...), total)
+	if withTotal {
+		probe = append(probe, total)
+	}
+
+	vis := make([]col, 0, len(all))
+	for _, c := range all {
+		if c.show == nil || c.show(probe) {
+			vis = append(vis, c)
+		}
+	}
+
+	// 让位：先按 dropSeq 淘汰非 keep 列（序小者先走），再压缩模型列。
+	// 每轮重新测量 —— 淘汰一列后其余列宽可能因数据分布变化而变。
+	// 迭代次数有上限，不会因测量不下而空转。
+	for {
+		widths := measureCols(vis, body, total, withTotal, totalLabel)
+		if maxWidth <= 0 || tableWidth(widths) <= maxWidth {
+			out := renderTable(vis, widths, body, total, withTotal, totalLabel, folded)
+			return out
+		}
+
+		// 找 dropSeq 最小的非 keep 列淘汰。
+		victim, minSeq := -1, 0
+		for i, c := range vis {
+			if c.keep {
+				continue
+			}
+			if victim < 0 || c.dropSeq < minSeq {
+				victim, minSeq = i, c.dropSeq
+			}
+		}
+		if victim >= 0 {
+			vis = append(vis[:victim], vis[victim+1:]...)
+			continue
+		}
+
+		// 没有可淘汰的列了，只能压缩模型列（下限 modelMinWidth）。
+		if vis[0].truncate > modelMinWidth {
+			next := vis[0].truncate - 2
+			if next < modelMinWidth {
+				next = modelMinWidth
+			}
+			vis[0] = columns(next)[0]
+			continue
+		}
+
+		// 已压到极限仍放不下：按当前宽度渲染，由调用方兜底（回落滚动输出）。
+		return renderTable(vis, widths, body, total, withTotal, totalLabel, folded)
+	}
+}
+
+// measureCols 计算各列的显示宽度（表头与所有取值的最大值）。
+//
+// 模型列额外受 truncate 约束：取值已在 columns 里按该宽度截断，故其宽度
+// 自然不超过它。
+func measureCols(vis []col, body []modelStat, total modelStat, withTotal bool, totalLabel string) []int {
 	widths := make([]int, len(vis))
 	for i, c := range vis {
 		widths[i] = displayWidth(c.head)
@@ -325,7 +446,24 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 			widths[0] = w
 		}
 	}
+	return widths
+}
 
+// tableWidth 返回按 widths 渲染出的表格行总宽（显示列）。
+//
+// 构成：行首空格 + 各列内容 + 列间 " | " + 行尾空格。与 renderTable 的
+// 构造规则一一对应，故两者不会各算各的。
+func tableWidth(widths []int) int {
+	total := 2 // 行首、行尾各一个空格
+	for _, w := range widths {
+		total += w
+	}
+	return total + 3*(len(widths)-1) // 每两个相邻列之间 3 列
+}
+
+// renderTable 按已定列宽渲染表格。folded > 0 时在明细后插入一行折叠提示
+// （说明还有多少模型未显示），使"被裁剪"这件事本身是可见的，而非静默丢数据。
+func renderTable(vis []col, widths []int, body []modelStat, total modelStat, withTotal bool, totalLabel string, folded int) []string {
 	// 单元格：首列左对齐（模型名），数字列右对齐。
 	cell := func(s string, i int) string {
 		if vis[i].right {
@@ -380,10 +518,47 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 	for _, m := range body {
 		out = append(out, renderRow("", m, false))
 	}
+	if folded > 0 {
+		// 折叠提示整行左对齐铺满，不参与列对齐 —— 它不属于数据列。
+		out = append(out, fitLine(fmt.Sprintf(" …另有 %d 个模型未显示（窗口过矮，可放大或去掉 -watch）", folded), tableWidth(widths)))
+	}
 	if withTotal {
 		out = append(out, sep.String(), renderRow(totalLabel, total, true))
 	}
 	return out
+}
+
+// frameRightMargin 是帧右边缘保留的空列数。
+//
+// 故意占满终端最后一列会踩到"待折行"（pending wrap）语义：写入末列后终端置位，
+// 紧随其后的擦除/换行序列可能被当成折行，使整帧下移一格并逐帧累积 —— 正是本
+// 次要修的这类错位。留一列即可规避，代价仅是少一列可用宽度。
+const frameRightMargin = 1
+
+// usableWidth 把探测到的终端宽度换算为可安全使用的排版宽度。
+//
+// 0（未知/不限）原样返回；过窄时保底 1 列，避免出现负数宽度。
+func usableWidth(termCols int) int {
+	if termCols <= 0 {
+		return 0
+	}
+	if w := termCols - frameRightMargin; w > 0 {
+		return w
+	}
+	return 1
+}
+
+// layout 是渲染可用的显示区域（显示列 × 行）；任一为 0 表示该维度不限。
+//
+// 为什么要限宽度：帧一旦宽于终端，终端会把一行折成两行，watch 的"上移 N 行"
+// 就回不到帧首（实际占用行数多于逻辑行数），于是每帧都在旧内容下方再画一份 ——
+// 窄窗口/分屏下的典型症状。
+//
+// pinW/pinH 标记该维度来自 -width/-height 而非自动探测：显式指定的值不随
+// 终端窗口变化（watch 每轮重新探测时分屏拖动会改变窗口，自动值要跟着变）。
+type layout struct {
+	width, height int
+	pinW, pinH    bool
 }
 
 // buildFrame 组装完整帧（标题 + 表格 + 尾注），返回逐行切片。
@@ -391,7 +566,10 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 // watch 与一次性快照共用此函数：两者内容完全一致，只是输出方式不同
 // （覆盖重绘 vs 顺序打印）。fetchErr 非 nil 时在帧内展示错误 —— watch 模式下
 // 错误若直接写 stderr 会冲乱已绘制的帧，且帧行数失配会导致覆盖错位。
-func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
+//
+// lay 限定渲染区域：表格会先按宽度裁剪（淘汰次要列 → 压缩模型列），再按高度
+// 裁剪（多余的模型行折叠为一行提示），保证产出的帧不超出终端。
+func buildFrame(st *statsResponse, sortKey string, fetchErr error, lay layout) []string {
 	var lines []string
 
 	// 标题说明统计口径：这里的时间是**统计窗口**，不是进程 uptime。
@@ -407,22 +585,42 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
 		}
 		title += " · " + win
 	}
-	lines = append(lines, title)
+	lines = append(lines, fitLine(title, lay.width))
 
 	// 分隔线一律用 ASCII '-'：'─'(U+2500) 的 East Asian Width 是 Ambiguous，
 	// 终端可能按 2 列渲染，导致与表格对不齐。ASCII 恒占 1 列。
 	//
 	// 表格存在时用表格宽度（视觉上与表格连成一体）；否则退回标题宽度，
 	// 保证错误/未启用/无数据这些短帧也有一条与内容相称的横线。
+	var table []string
+	if fetchErr == nil && st != nil && st.Enabled && len(st.Models) > 0 {
+		// 高度预算：标题、分隔线、尾注各占一行；宽度受限时可能还要多一行裁剪
+		// 提示，一并预留 —— 帧比窗口矮无妨，比窗口高就必然错位。
+		maxRows := 0
+		if lay.height > 0 {
+			maxRows = lay.height - 3
+			if lay.width > 0 {
+				maxRows--
+			}
+			if maxRows < 3 {
+				maxRows = 3 // 表头+分隔线+至少一行明细
+			}
+		}
+		table = buildTable(st.Models, st.Total, sortKey, lay.width, maxRows)
+	}
+
 	ruleWidth := displayWidth(title)
-	if st != nil && st.Enabled && len(st.Models) > 0 {
-		ruleWidth = displayWidth(buildTable(st.Models, st.Total, sortKey)[0])
+	if len(table) > 0 {
+		ruleWidth = displayWidth(table[0])
+	}
+	if lay.width > 0 && ruleWidth > lay.width {
+		ruleWidth = lay.width
 	}
 	rule := strings.Repeat("-", ruleWidth)
 
 	if fetchErr != nil {
 		// 帧内报错：保留标题与分隔线（帧结构稳定），错误信息作为表体。
-		return append(lines, rule, "⚠ "+fetchErr.Error())
+		return append(lines, rule, fitLine("⚠ "+fetchErr.Error(), lay.width))
 	}
 
 	if !st.Enabled {
@@ -430,16 +628,27 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
 		if msg == "" {
 			msg = "请在网关配置中设置 server.metrics_enabled=true"
 		}
-		return append(lines, rule, "⚠ 网关未启用请求统计", "  "+msg)
+		return append(lines, rule, "⚠ 网关未启用请求统计", fitLine("  "+msg, lay.width))
 	}
 
 	if len(st.Models) == 0 {
-		return append(lines, rule, "暂无数据 —— 统计窗口内没有请求记录（-json 可取原始字段）")
+		return append(lines, rule, fitLine("暂无数据 —— 统计窗口内没有请求记录（-json 可取原始字段）", lay.width))
 	}
 
 	lines = append(lines, rule)
-	lines = append(lines, buildTable(st.Models, st.Total, sortKey)...)
-	return append(lines, "扣费单位=账号积分（非货币）· 完整字段见 -json")
+	lines = append(lines, table...)
+	return append(lines, fitLine("扣费单位=账号积分（非货币）· 完整字段见 -json", lay.width))
+}
+
+// fitLine 把单行文本裁到不超过 width 显示列（width<=0 表示不限）。
+//
+// 用于标题、尾注、错误行这些不参与列对齐的行：它们超宽同样会折行并破坏
+// watch 的光标上移量，故一并裁剪。
+func fitLine(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	return truncateWidth(s, width)
 }
 
 // ─── 输出：一次性 vs 原地刷新 ─────────────────────────────────────────────
@@ -449,7 +658,10 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
 // 覆盖方式不用全屏清屏（\033[2J）—— 那会闪屏且清掉滚动缓冲。改为相对移动
 // 光标回到帧首 + 逐行擦到行尾 + 帧尾清除多余旧行。tty 为 false（被重定向/
 // 无控制台）时回落为顺序打印，保证管道用法可读。
-func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, interval time.Duration, tty bool) int {
+//
+// 尺寸每轮重新探测：终端窗口（尤其分屏）随时可能被拖动改变，用旧尺寸排版会
+// 让帧再次超出可视区。
+func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, interval time.Duration, tty bool, lay layout) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -459,47 +671,92 @@ func runWatch(baseURL, apiKey string, timeout time.Duration, sortKey string, int
 	}
 
 	prevLines := 0
+	overlap := true // 上一帧是否以"原地覆盖"方式绘制（决定本轮能否上移光标）
 	for {
 		// 拉取失败且没有可用数据时，错误进帧内展示（而非 stderr），
 		// 保证帧结构的行数稳定、覆盖重绘不错位。
 		st, err := fetch(baseURL, apiKey, timeout)
 		var frame []string
 		if err != nil {
-			frame = buildFrame(&statsResponse{}, sortKey, err)
+			frame = buildFrame(&statsResponse{}, sortKey, err, lay)
 		} else {
-			frame = buildFrame(st, sortKey, nil)
+			frame = buildFrame(st, sortKey, nil, lay)
 		}
 
-		if tty {
-			rewriteFrame(frame, prevLines)
+		// 兜底：帧必须严格放得进窗口。若仍超出（窗口窄于最简表的固有宽度，
+		// 例如只有十几列），原地覆盖必然错位 —— 此时退回滚动输出，宁可刷屏
+		// 也不要内容互相覆盖成乱码。
+		fits := frameFits(frame, lay)
+		if tty && fits {
+			rewriteFrame(frame, prevLines, overlap)
 		} else {
-			// 回落：每帧顺序打印，帧间空行分隔。
+			// 回落：顺序打印，帧间空行分隔。用 prevLines=0 通知下一帧不要上移
+			// 光标 —— 本轮内容是被推上去的，位置与上一帧的记账不符。
 			for _, l := range frame {
 				fmt.Println(l)
 			}
 			fmt.Println()
+			overlap = false
 		}
 		prevLines = len(frame)
+		if tty && fits {
+			overlap = true
+		}
 
 		select {
 		case <-ctx.Done():
-			if tty {
+			if tty && overlap {
 				// 退出前把光标移到帧尾下方，避免提示符接在帧内容后面。
 				fmt.Printf("\033[%dB\n", 1)
 			}
 			return 0
 		case <-time.After(interval):
+			// 尺寸可能已变（用户拖动分屏）：重新探测，仅覆盖未被显式指定的维度。
+			lay = refreshLayout(lay)
 		}
 	}
+}
+
+// frameFits 报告帧是否放得进渲染区域（任一无约束时该维度视为通过）。
+//
+// 宽度是关键：只要有一行宽于窗口，终端就会折行，帧的实际占用行数多于
+// len(frame)，"上移 N 行"随即失准并导致堆叠。
+func frameFits(frame []string, lay layout) bool {
+	if lay.width > 0 {
+		for _, l := range frame {
+			if displayWidth(l) > lay.width {
+				return false
+			}
+		}
+	}
+	return lay.height <= 0 || len(frame) <= lay.height
+}
+
+// refreshLayout 重新探测终端尺寸，仅更新"自动"维度（-width/-height 指定的保持不变）。
+//
+// 每轮都重新探测：分屏拖动会改变窗口尺寸，沿用旧尺寸排版会让帧重新超出可视区，
+// 于是又回到"折行 → 光标上移失准 → 堆叠"的老路。
+func refreshLayout(lay layout) layout {
+	cols, rows := termSize()
+	if cols > 0 && !lay.pinW {
+		lay.width = usableWidth(cols)
+	}
+	if rows > 0 && !lay.pinH {
+		lay.height = rows
+	}
+	return lay
 }
 
 // rewriteFrame 覆盖重绘：回到帧首 → 逐行擦除写入 → 清除多余旧行。
 //
 // 帧内每行以 \r\n 结尾，故写完 M 行后光标停在第 M+1 行行首。下一帧据此上移
 // prevLines 行即可精确回到帧首；帧变短时多余旧行由帧尾的 \033[J 擦除。
-func rewriteFrame(lines []string, prevLines int) {
+//
+// overlap 为 false 表示上一帧不是原地覆盖绘制的（走了滚动回落，内容已被
+// 推入滚动缓冲），此时不能上移光标 —— 那会吃掉与此帧无关的既有输出。
+func rewriteFrame(lines []string, prevLines int, overlap bool) {
 	var b strings.Builder
-	if prevLines > 0 {
+	if overlap && prevLines > 0 {
 		// 光标上移 prevLines 行，回到上一帧起点（列 0）。
 		fmt.Fprintf(&b, "\033[%dA", prevLines)
 	}
