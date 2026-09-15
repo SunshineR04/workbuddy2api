@@ -290,7 +290,15 @@ func TestSortModels(t *testing.T) {
 
 // ─── 单表渲染 ─────────────────────────────────────────────────────────────
 
+// testNow 是表格测试共用的"当前时刻"，与 mkModel 的时间基准配合，
+// 让"最后活动"这类相对时间列的渲染结果完全确定、可断言。
+var testNow = time.Date(2026, 9, 15, 21, 30, 0, 0, time.UTC)
+
 // mkModel 造一行统计，只填关心的字段。
+//
+// 刻意**不填** Streaming / LastSeen / CacheWriteTokens：这三列都有 show 条件，
+// 全零时自动隐藏 —— 于是既有测试看到的仍是原来的 9 列，不受新增列干扰。
+// 需要它们的用例自行赋值（见 mkRichModel）。
 func mkModel(name string, req int64, failed int64) modelStat {
 	return modelStat{
 		Model: name, Requests: req, Success: req - failed, Failed: failed,
@@ -301,10 +309,21 @@ func mkModel(name string, req int64, failed int64) modelStat {
 	}
 }
 
+// mkRichModel 在 mkModel 之上补齐三个"填充性列"所需的字段。
+func mkRichModel(name string, req, failed, streaming int64, lastSeen string) modelStat {
+	m := mkModel(name, req, failed)
+	m.Streaming = streaming
+	if lastSeen != "" {
+		s := lastSeen
+		m.LastSeen = &s
+	}
+	return m
+}
+
 // TestTableSingleModelNoTotalRow 单模型时不出现合计行 —— 那一行本身就是汇总。
 func TestTableSingleModelNoTotalRow(t *testing.T) {
 	rows := []modelStat{mkModel("deepseek-v4.1-flash", 131, 0)}
-	table := buildTable(rows, mkModel("(all)", 131, 0), "requests", 0, 0)
+	table := buildTable(rows, mkModel("(all)", 131, 0), "requests", 0, 0, testNow)
 
 	joined := strings.Join(table, "\n")
 	if strings.Contains(joined, "合计") {
@@ -319,7 +338,7 @@ func TestTableSingleModelNoTotalRow(t *testing.T) {
 // TestTableMultiModelHasTotalRow 多模型时出现分隔线 + 合计行。
 func TestTableMultiModelHasTotalRow(t *testing.T) {
 	rows := []modelStat{mkModel("a", 131, 0), mkModel("b", 70, 0)}
-	table := buildTable(rows, mkModel("(all)", 201, 0), "requests", 0, 0)
+	table := buildTable(rows, mkModel("(all)", 201, 0), "requests", 0, 0, testNow)
 
 	joined := strings.Join(table, "\n")
 	if !strings.Contains(joined, "合计") {
@@ -334,12 +353,12 @@ func TestTableMultiModelHasTotalRow(t *testing.T) {
 // TestTableFailedColumnHidden 全部成功时不出现失败列（常态下省 4 列宽度）；
 // 任一模型有失败则出现。
 func TestTableFailedColumnHidden(t *testing.T) {
-	noFail := buildTable([]modelStat{mkModel("a", 10, 0)}, mkModel("(all)", 10, 0), "requests", 0, 0)
+	noFail := buildTable([]modelStat{mkModel("a", 10, 0)}, mkModel("(all)", 10, 0), "requests", 0, 0, testNow)
 	if strings.Contains(strings.Join(noFail, "\n"), "失败") {
 		t.Errorf("无失败时不应出现失败列:\n%s", strings.Join(noFail, "\n"))
 	}
 
-	withFail := buildTable([]modelStat{mkModel("a", 10, 2)}, mkModel("(all)", 10, 2), "requests", 0, 0)
+	withFail := buildTable([]modelStat{mkModel("a", 10, 2)}, mkModel("(all)", 10, 2), "requests", 0, 0, testNow)
 	if !strings.Contains(strings.Join(withFail, "\n"), "失败") {
 		t.Errorf("有失败时应出现失败列:\n%s", strings.Join(withFail, "\n"))
 	}
@@ -357,7 +376,7 @@ func TestTableColumnsAligned(t *testing.T) {
 		{mkModel("x", 0, 0)}, // 全零行：占位符也要保持等宽
 	}
 	for i, rows := range cases {
-		tbl := buildTable(rows, mkModel("(all)", 131, 0), "requests", 0, 0)
+		tbl := buildTable(rows, mkModel("(all)", 131, 0), "requests", 0, 0, testNow)
 		want := displayWidth(tbl[0])
 		for j, line := range tbl {
 			if got := displayWidth(line); got != want {
@@ -373,7 +392,7 @@ func TestTableColumnsAligned(t *testing.T) {
 // 不同（如 + 比 | 多占一列）同样会错位。故按显示列逐一比对。
 func TestTableSeparatorAlignsBars(t *testing.T) {
 	rows := []modelStat{mkModel("a", 131, 0), mkModel("中文模型名较长", 70, 3)}
-	tbl := buildTable(rows, mkModel("(all)", 201, 3), "requests", 0, 0)
+	tbl := buildTable(rows, mkModel("(all)", 201, 3), "requests", 0, 0, testNow)
 
 	// 找出所有含竖线的行（表头与每个数据行），以及所有分隔线行。
 	var dataLines, sepLines []string
@@ -405,7 +424,7 @@ func TestTableSeparatorAlignsBars(t *testing.T) {
 // TestTableSeparatorWidthMatchesRows 分隔线与数据行等宽（TestTableColumnsAligned
 // 已覆盖等宽，此处单独断言以便失败信息更直白）。
 func TestTableSeparatorWidthMatchesRows(t *testing.T) {
-	tbl := buildTable([]modelStat{mkModel("m", 5, 0)}, mkModel("(all)", 5, 0), "requests", 0, 0)
+	tbl := buildTable([]modelStat{mkModel("m", 5, 0)}, mkModel("(all)", 5, 0), "requests", 0, 0, testNow)
 	if len(tbl) < 3 {
 		t.Fatalf("表至少应有表头+分隔线+1 行，得到 %d 行", len(tbl))
 	}
@@ -420,7 +439,7 @@ func TestTableSeparatorWidthMatchesRows(t *testing.T) {
 // U+2500 的 East Asian Width 是 Ambiguous：终端可按 1 或 2 列渲染，导致
 // 分隔线与表格对不齐（这正是改用 ASCII 的原因）。故断言分隔线字符集。
 func TestTableUsesOnlyASCIIBorder(t *testing.T) {
-	tbl := buildTable([]modelStat{mkModel("m", 5, 0), mkModel("n", 7, 0)}, mkModel("(all)", 12, 0), "requests", 0, 0)
+	tbl := buildTable([]modelStat{mkModel("m", 5, 0), mkModel("n", 7, 0)}, mkModel("(all)", 12, 0), "requests", 0, 0, testNow)
 	for _, l := range tbl {
 		for _, r := range l {
 			if r > 0x7F {

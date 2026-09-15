@@ -37,7 +37,7 @@ func multiRows() ([]modelStat, modelStat) {
 func TestTableFitsWithinWidth(t *testing.T) {
 	rows, total := multiRows()
 	for w := 28; w <= 200; w++ {
-		tbl := buildTable(rows, total, "requests", w, 0)
+		tbl := buildTable(rows, total, "requests", w, 0, testNow)
 		if got := maxFrameWidth(tbl); got > w {
 			t.Errorf("宽度上限 %d 时表格宽 %d（会折行）:\n%s", w, got, strings.Join(tbl, "\n"))
 		}
@@ -51,7 +51,7 @@ func TestTableFitsWithinWidth(t *testing.T) {
 func TestTableDropsColumnsBeforeWrapping(t *testing.T) {
 	rows, total := multiRows()
 
-	wide := strings.Join(buildTable(rows, total, "requests", 200, 0), "\n")
+	wide := strings.Join(buildTable(rows, total, "requests", 200, 0, testNow), "\n")
 	for _, h := range []string{"缓存命中", "输入/输出", "吞吐", "耗时", "首字", "扣费", "请求", "失败"} {
 		if !strings.Contains(wide, h) {
 			t.Errorf("宽窗口应含列 %q:\n%s", h, wide)
@@ -62,7 +62,7 @@ func TestTableDropsColumnsBeforeWrapping(t *testing.T) {
 	sawFewer := false
 	prevCols := 99
 	for _, w := range []int{200, 120, 100, 86, 70, 50} {
-		tbl := buildTable(rows, total, "requests", w, 0)
+		tbl := buildTable(rows, total, "requests", w, 0, testNow)
 		joined := strings.Join(tbl, "\n")
 		cols := strings.Count(tbl[0], "|") + 1
 		if cols > prevCols {
@@ -89,7 +89,7 @@ func TestTableNoBracketBreak(t *testing.T) {
 	rows := []modelStat{mkModel("a", 131, 0), mkModel("中文模型名较长", 70, 3)}
 	total := mkModel("(all)", 201, 3)
 	for _, w := range []int{200, 120, 100, 86, 70, 50, 34} {
-		tbl := buildTable(rows, total, "requests", w, 0)
+		tbl := buildTable(rows, total, "requests", w, 0, testNow)
 		var dataLines, sepLines []string
 		for _, l := range tbl {
 			switch {
@@ -122,7 +122,7 @@ func TestTableFoldsRowsWhenHeightLimited(t *testing.T) {
 	total := mkModel("(all)", 1200, 0)
 
 	// 行数预算 8：表头+分隔线+分隔线+合计 = 4 固定，明细可用 4 行。
-	tbl := buildTable(rows, total, "requests", 200, 8)
+	tbl := buildTable(rows, total, "requests", 200, 8, testNow)
 	if len(tbl) > 8 {
 		t.Errorf("行数 = %d 超出预算 8:\n%s", len(tbl), strings.Join(tbl, "\n"))
 	}
@@ -134,7 +134,7 @@ func TestTableFoldsRowsWhenHeightLimited(t *testing.T) {
 		t.Errorf("合计行应保留:\n%s", joined)
 	}
 	// 不限行数时不得出现折叠提示。
-	if full := strings.Join(buildTable(rows, total, "requests", 200, 0), "\n"); strings.Contains(full, "另有") {
+	if full := strings.Join(buildTable(rows, total, "requests", 200, 0, testNow), "\n"); strings.Contains(full, "另有") {
 		t.Errorf("不限行数时不应折叠:\n%s", full)
 	}
 }

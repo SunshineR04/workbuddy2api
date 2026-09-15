@@ -105,6 +105,7 @@ func main() {
 	lay := resolveLayout(*width, *height)
 
 	if *watch > 0 {
+		// 备用屏只在真有控制台时启用：管道/重定向下那串转义会污染输出。
 		os.Exit(runWatch(baseURL, apiKey, *timeout, *sortKey, *watch, tty, lay))
 	}
 
@@ -262,8 +263,31 @@ type col struct {
 // 再窄就连 "cn:deepseek…" 这类前缀都区分不出，不如不压。
 const modelMinWidth = 12
 
-// modelNameMaxWidth 是模型列在窗口充裕时的最大宽度（显示列）。
+// modelNameMaxWidth 是模型列取值被截断前允许的最大显示宽度。
+// 注意它是**内容**上限，与下面 modelColMaxWidth 的**列宽**上限是两回事。
 const modelNameMaxWidth = 28
+
+// ── 横向铺满：列间距与模型列吸宽 ──────────────────────────────────────────
+//
+// 表格自然宽度只取决于「列数 × 各列内容宽度」，与终端多宽无关。窗口比表格宽时
+// 右侧会留白，看起来很空。填法有两种，本实现**按此优先级**分配余量：
+//
+//  1. 列间距（最小 → 最大）：把空白摊到各列之间，观感是"排得开"，不破坏对齐；
+//  2. 模型列吸宽：剩余余量给模型列，让名字不再贴边。
+//
+// 但两者都有**硬上限**，超过就诚实留白 —— 无上限地拉伸会制造"内部空洞"：
+// 模型列被撑到 60+ 列宽时，名字与后面的数字之间隔着一大片空白，比留白更难看。
+const (
+	// gutterMin 是列间 " | " 的最小空格数（竖线每侧 1 个）。
+	gutterMin = 1
+
+	// gutterMax 是列间空格数的上限。再宽则相邻列相距过远，视线横跨时容易串行。
+	gutterMax = 3
+
+	// modelColMaxWidth 是模型列的**列宽**上限（不是内容截断上限）。
+	// 超过它就不再为铺满而拉宽，余量留白。
+	modelColMaxWidth = 40
+)
 
 // columns 返回列定义。顺序即渲染顺序；modelBudget 为模型列的截断宽度。
 //
@@ -272,9 +296,14 @@ const modelNameMaxWidth = 28
 //
 // keep / dropSeq 决定窗口过窄时的让位次序：keep 列永不裁剪（模型、请求、失败
 // 丢了表格就失去意义），其余列按 dropSeq 从小到大依次让位 —— 序小者先走。
-// 排序依据是"信息价值 ÷ 宽度"：缓存命中、输入/输出 这类既宽又偏诊断性的先让位；
-// 扣费（等于钱）虽窄也留到最后。
-func columns(modelBudget int) []col {
+//
+// 让位序的排序依据是"信息价值 ÷ 宽度"：
+//   - 缓存写入 / 流式 / 最后活动 是**填充性**列（顺带铺满宽窗口），最不值钱，先走；
+//   - 缓存命中、输入/输出 既宽又偏诊断性，居中；
+//   - 扣费（等于钱）虽窄也留到最后。
+//
+// now 用于把 last_seen 渲染成相对时间（"22.0h前"）；取零值时该列显示占位符。
+func columns(modelBudget int, now time.Time) []col {
 	return []col{
 		{head: "模型", keep: true, truncate: modelBudget, value: func(m modelStat) string {
 			return truncateWidth(m.Model, modelBudget)
@@ -289,25 +318,91 @@ func columns(modelBudget int) []col {
 				}
 				return false
 			}},
-		{head: "首字", right: true, dropSeq: 5, value: func(m modelStat) string { return fmtMillis(m.AvgTTFBMS) }},
-		{head: "耗时", right: true, dropSeq: 4, value: func(m modelStat) string { return fmtMillis(m.AvgLatencyMS) }},
-		{head: "吞吐", right: true, dropSeq: 3, value: func(m modelStat) string { return fmtRate(m.TokensPerSec) }},
-		{head: "输入/输出", right: true, dropSeq: 2, value: func(m modelStat) string {
+		{head: "首字", right: true, dropSeq: 8, value: func(m modelStat) string { return fmtMillis(m.AvgTTFBMS) }},
+		{head: "耗时", right: true, dropSeq: 7, value: func(m modelStat) string { return fmtMillis(m.AvgLatencyMS) }},
+		{head: "吞吐", right: true, dropSeq: 6, value: func(m modelStat) string { return fmtRate(m.TokensPerSec) }},
+		{head: "输入/输出", right: true, dropSeq: 5, value: func(m modelStat) string {
 			// 无 usage 观测时（无 token 数据）显示占位符，不显示 0/0 误导。
 			if m.PromptTokens == 0 && m.CompletionTokens == 0 {
 				return "-"
 			}
 			return fmtTokens(m.PromptTokens) + "/" + fmtTokens(m.CompletionTokens)
 		}},
-		{head: "缓存命中", right: true, dropSeq: 1, value: func(m modelStat) string {
+		{head: "缓存命中", right: true, dropSeq: 4, value: func(m modelStat) string {
 			if m.CacheHitTokens+m.CacheMissTokens == 0 {
 				return "-"
 			}
 			return fmt.Sprintf("%.1f%%", m.CacheHitRate*100)
 		}},
-		{head: "扣费", right: true, dropSeq: 6, value: func(m modelStat) string {
+		{head: "扣费", right: true, dropSeq: 9, value: func(m modelStat) string {
 			return fmt.Sprintf("%.2f", m.Credit)
 		}},
+
+		// ── 填充性列：网关本就返回、此前未展示 ──
+		//
+		// 只纳入**非冗余**字段。success（=请求−失败）、total_tokens（=输入+输出）、
+		// credit_per_req（=扣费÷请求）都能由已有列算出，摆上来只是重复信息，故不纳入。
+		// 这三列顺带把宽窗口的右侧空白填上，但让位序排在最后（最不值钱）。
+		{head: "流式", right: true, dropSeq: 2, value: func(m modelStat) string { return fmtInt(m.Streaming) },
+			show: func(rows []modelStat) bool {
+				for _, m := range rows {
+					if m.Streaming > 0 {
+						return true
+					}
+				}
+				return false
+			}},
+		{head: "最后活动", right: true, dropSeq: 3, value: func(m modelStat) string { return fago(m.LastSeen, now) },
+			show: func(rows []modelStat) bool {
+				for _, m := range rows {
+					if m.LastSeen != nil && *m.LastSeen != "" {
+						return true
+					}
+				}
+				return false
+			}},
+		{head: "缓存写入", right: true, dropSeq: 1,
+			value: func(m modelStat) string { return fmtTokens(m.CacheWriteTokens) },
+			show: func(rows []modelStat) bool {
+				// 当前网关恒为 0（未采集该指标），故常态隐藏；一旦开始采集会自动出现。
+				for _, m := range rows {
+					if m.CacheWriteTokens > 0 {
+						return true
+					}
+				}
+				return false
+			}},
+	}
+}
+
+// fago 把 last_seen 渲染成相对当前时刻的简短表达（"42s前" / "17m前" / "22.0h前"）。
+//
+// 用网关响应里的 now 而非 time.Now()：网关可能是远程的（WB2A_URL），以它的
+// 时钟为准才不会因两端时钟偏差算出负数；同时也让渲染完全确定、可测。
+//
+// 解析失败、字段缺失或 now 为零值时回落 "-"，绝不 panic —— 旧版网关可能没有
+// last_seen 字段。
+func fago(lastSeen *string, now time.Time) string {
+	if lastSeen == nil || *lastSeen == "" || now.IsZero() {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, *lastSeen)
+	if err != nil {
+		return "-"
+	}
+	d := now.Sub(t)
+	if d < 0 {
+		d = 0 // 两端时钟偏差导致的"未来"时刻：按刚刚活动处理，不显示负数
+	}
+	switch {
+	case d < 90*time.Second:
+		return fmt.Sprintf("%ds前", int(d.Seconds()))
+	case d < 90*time.Minute:
+		return fmt.Sprintf("%dm前", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%.1fh前", d.Hours())
+	default:
+		return fmt.Sprintf("%.0fd前", d.Hours()/24)
 	}
 }
 
@@ -329,11 +424,14 @@ func columns(modelBudget int) []col {
 // maxWidth 为可用显示宽度（<=0 表示不限）：超宽时先按 dropSeq 淘汰最不重要的列，
 // 再压缩模型列，直到放得下。窗口过窄时必须裁剪 —— 一旦表格宽于窗口，终端会把
 // 一行折成两行，watch 的"上移 N 行"就会错位并堆叠。
+// 反过来窗口宽于表格时（maxWidth 有余量），余量交给 allocWidth 去铺满。
 //
 // maxRows 为表格可用的总行数（<=0 表示不限，含表头/分隔线/合计行）：超出时保留
 // 头部若干行，其余折叠为一行"…另有 N 个模型"提示。高度同样必须约束 —— 帧高于
 // 窗口时首行会被顶出可视区，watch 回不到帧首。
-func buildTable(rows []modelStat, total modelStat, sortKey string, maxWidth, maxRows int) []string {
+//
+// now 用于把 last_seen 渲染成相对时间，取值来自网关响应的 now 字段。
+func buildTable(rows []modelStat, total modelStat, sortKey string, maxWidth, maxRows int, now time.Time) []string {
 	// 排序后的明细（合计行不参与排序，永远置底）。
 	body := make([]modelStat, len(rows))
 	copy(body, rows)
@@ -368,7 +466,7 @@ func buildTable(rows []modelStat, total modelStat, sortKey string, maxWidth, max
 
 	// 失败列的显隐要考虑合计行：明细全 0 但合计非 0 在数学上不可能，
 	// 但显式纳入可让边界（如部分模型缺数据）行为可预期。
-	all := columns(modelNameMaxWidth)
+	all := columns(modelNameMaxWidth, now)
 	probe := append(append([]modelStat(nil), body...), total)
 	if withTotal {
 		probe = append(probe, total)
@@ -381,14 +479,22 @@ func buildTable(rows []modelStat, total modelStat, sortKey string, maxWidth, max
 		}
 	}
 
+	// emit 把已定列宽渲染成表格行，顺带把余量分配掉（间距 → 模型列）。
+	emit := func(widths []int) []string {
+		w, g := allocWidth(widths, maxWidth)
+		return renderTable(vis, w, g, body, total, withTotal, totalLabel, folded)
+	}
+
 	// 让位：先按 dropSeq 淘汰非 keep 列（序小者先走），再压缩模型列。
 	// 每轮重新测量 —— 淘汰一列后其余列宽可能因数据分布变化而变。
 	// 迭代次数有上限，不会因测量不下而空转。
+	//
+	// 判定用**自然宽度**（最小间距、模型列不吸宽）：只有自然宽度都放不下才需要
+	// 让位；一旦放得下，剩余空间才轮到 allocWidth 去铺满。
 	for {
 		widths := measureCols(vis, body, total, withTotal, totalLabel)
-		if maxWidth <= 0 || tableWidth(widths) <= maxWidth {
-			out := renderTable(vis, widths, body, total, withTotal, totalLabel, folded)
-			return out
+		if maxWidth <= 0 || tableWidth(widths, gutterMin) <= maxWidth {
+			return emit(widths)
 		}
 
 		// 找 dropSeq 最小的非 keep 列淘汰。
@@ -412,12 +518,12 @@ func buildTable(rows []modelStat, total modelStat, sortKey string, maxWidth, max
 			if next < modelMinWidth {
 				next = modelMinWidth
 			}
-			vis[0] = columns(next)[0]
+			vis[0] = columns(next, now)[0]
 			continue
 		}
 
 		// 已压到极限仍放不下：按当前宽度渲染，由调用方兜底（回落滚动输出）。
-		return renderTable(vis, widths, body, total, withTotal, totalLabel, folded)
+		return emit(widths)
 	}
 }
 
@@ -449,21 +555,60 @@ func measureCols(vis []col, body []modelStat, total modelStat, withTotal bool, t
 	return widths
 }
 
-// tableWidth 返回按 widths 渲染出的表格行总宽（显示列）。
+// tableWidth 返回按 widths、间距 g 渲染出的表格行总宽（显示列）。
 //
-// 构成：行首空格 + 各列内容 + 列间 " | " + 行尾空格。与 renderTable 的
-// 构造规则一一对应，故两者不会各算各的。
-func tableWidth(widths []int) int {
+// 构成：行首空格 + 各列内容 + 列间「g 个空格 + | + g 个空格」 + 行尾空格。
+// 与 renderTable 的构造规则一一对应，故两者不会各算各的。
+func tableWidth(widths []int, g int) int {
 	total := 2 // 行首、行尾各一个空格
 	for _, w := range widths {
 		total += w
 	}
-	return total + 3*(len(widths)-1) // 每两个相邻列之间 3 列
+	return total + (2*g+1)*(len(widths)-1) // 列间：g 空格 + | + g 空格
 }
 
-// renderTable 按已定列宽渲染表格。folded > 0 时在明细后插入一行折叠提示
-// （说明还有多少模型未显示），使"被裁剪"这件事本身是可见的，而非静默丢数据。
-func renderTable(vis []col, widths []int, body []modelStat, total modelStat, withTotal bool, totalLabel string, folded int) []string {
+// allocWidth 把终端余量分配给列间距与模型列，返回调整后的列宽与间距。
+//
+// 分配优先级（见 gutterMax / modelColMaxWidth 处的说明）：
+//
+//  1. 间距先从 gutterMin 涨到 gutterMax —— 空白摊到各列之间，观感是"排得开"；
+//  2. 再把余量逐列加给模型列，直到 modelColMaxWidth；
+//  3. 仍有余量则**留白**，不再硬撑。
+//
+// 第 3 步是刻意的：无上限拉伸会制造"内部空洞"（模型列被撑到 60+ 列时，名字与
+// 后面的数字之间隔着一大片空白），比右侧留白更难看。所以宁可不满。
+//
+// maxWidth <= 0（不限宽，如管道输出）时不做任何调整：没有终端可言，自然宽度
+// 才是脚本想看到的东西。
+func allocWidth(widths []int, maxWidth int) ([]int, int) {
+	if maxWidth <= 0 || len(widths) == 0 {
+		return widths, gutterMin
+	}
+
+	out := make([]int, len(widths))
+	copy(out, widths)
+
+	// 第 1 步：间距。每加 1 个空格，总宽增加 2*(列数-1)。
+	g := gutterMin
+	for g < gutterMax && tableWidth(out, g+1) <= maxWidth {
+		g++
+	}
+
+	// 第 2 步：模型列吸宽（逐列 +1，直到上限或放不下）。
+	for out[0] < modelColMaxWidth && tableWidth(out, g)+1 <= maxWidth {
+		out[0]++
+	}
+
+	return out, g
+}
+
+// renderTable 按已定列宽与间距 g 渲染表格。folded > 0 时在明细后插入一行折叠
+// 提示（说明还有多少模型未显示），使"被裁剪"这件事本身是可见的，而非静默丢数据。
+func renderTable(vis []col, widths []int, g int, body []modelStat, total modelStat, withTotal bool, totalLabel string, folded int) []string {
+	// 列间分隔：g 个空格 + 竖线 + g 个空格。间距可调，但竖线位置由列宽累加
+	// 唯一确定，故 + 与 | 必然逐列同位（不依赖任何估算）。
+	gap := strings.Repeat(" ", g) + "|" + strings.Repeat(" ", g)
+
 	// 单元格：首列左对齐（模型名），数字列右对齐。
 	cell := func(s string, i int) string {
 		if vis[i].right {
@@ -472,13 +617,13 @@ func renderTable(vis []col, widths []int, body []modelStat, total modelStat, wit
 		return padRight(s, widths[i])
 	}
 
-	// 数据行：' ' + cell + ' ' 组成一段，段间以 " | " 相连，行首行尾各留一空格。
+	// 数据行：' ' + cell + ' ' 组成一段，段间以 gap 相连，行首行尾各留一空格。
 	renderRow := func(label string, m modelStat, useLabel bool) string {
 		var b strings.Builder
 		b.WriteByte(' ')
 		for i := range vis {
 			if i > 0 {
-				b.WriteString(" | ")
+				b.WriteString(gap)
 			}
 			s := vis[i].value(m)
 			if i == 0 && useLabel {
@@ -495,20 +640,20 @@ func renderTable(vis []col, widths []int, body []modelStat, total modelStat, wit
 	head.WriteByte(' ')
 	for i, c := range vis {
 		if i > 0 {
-			head.WriteString(" | ")
+			head.WriteString(gap)
 		}
 		head.WriteString(cell(c.head, i))
 	}
 	head.WriteByte(' ')
 
 	// 分隔线：逐字符与表头/数据行对齐 ——
-	// 行首空格→'-'，每段内容→'-'×列宽，两侧空格与段间 " | "→'-'，
-	// 竖线位置→'+'。直接按同构规则生成，故长度必然与数据行相等。
+	// 行首空格→'-'，每段内容→'-'×列宽，列间「g 空格 + | + g 空格」→
+	// 「'-'×g + '+' + '-'×g」。按同构规则生成，故长度必然与数据行相等。
 	var sep strings.Builder
 	sep.WriteString("-") // 对应表头的行首空格
 	for i := range vis {
 		if i > 0 {
-			sep.WriteString("-+-") // 对应 " | "
+			sep.WriteString(strings.Repeat("-", g) + "+" + strings.Repeat("-", g))
 		}
 		sep.WriteString(strings.Repeat("-", widths[i]))
 	}
@@ -520,7 +665,7 @@ func renderTable(vis []col, widths []int, body []modelStat, total modelStat, wit
 	}
 	if folded > 0 {
 		// 折叠提示整行左对齐铺满，不参与列对齐 —— 它不属于数据列。
-		out = append(out, fitLine(fmt.Sprintf(" …另有 %d 个模型未显示（窗口过矮，可放大或去掉 -watch）", folded), tableWidth(widths)))
+		out = append(out, fitLine(fmt.Sprintf(" …另有 %d 个模型未显示（窗口过矮，可放大或去掉 -watch）", folded), tableWidth(widths, g)))
 	}
 	if withTotal {
 		out = append(out, sep.String(), renderRow(totalLabel, total, true))
@@ -606,7 +751,7 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error, lay layout) [
 				maxRows = 3 // 表头+分隔线+至少一行明细
 			}
 		}
-		table = buildTable(st.Models, st.Total, sortKey, lay.width, maxRows)
+		table = buildTable(st.Models, st.Total, sortKey, lay.width, maxRows, frameNow(st))
 	}
 
 	ruleWidth := displayWidth(title)
@@ -649,6 +794,20 @@ func fitLine(s string, width int) string {
 		return s
 	}
 	return truncateWidth(s, width)
+}
+
+// frameNow 取渲染"最后活动"列所用的当前时刻。
+//
+// 优先用网关响应里的 now：网关可能是远程的（WB2A_URL），以它的时钟为准才不会
+// 因两端时钟偏差把"刚刚发生"算成负数或离谱值。字段缺失或解析失败时回落到本机
+// 时间 —— 总比不显示强。
+func frameNow(st *statsResponse) time.Time {
+	if st != nil && st.Now != "" {
+		if t, err := time.Parse(time.RFC3339, st.Now); err == nil {
+			return t
+		}
+	}
+	return time.Now()
 }
 
 // ─── 输出：一次性 vs 原地刷新 ─────────────────────────────────────────────
