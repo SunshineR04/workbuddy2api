@@ -394,9 +394,18 @@ func buildTable(rows []modelStat, total modelStat, sortKey string) []string {
 func buildFrame(st *statsResponse, sortKey string, fetchErr error) []string {
 	var lines []string
 
+	// 标题说明统计口径：这里的时间是**统计窗口**，不是进程 uptime。
+	//
+	// since 持久化在网关的 metrics.json 里、跨重启保留（只在 reset 或删文件时
+	// 重置），因此进程重启后窗口仍从原起点续算。若写成"运行 XXh"会被误读为
+	// 进程已运行多久，故同时给出窗口时长与起始时刻，避免歧义。
 	title := "📈 网关请求统计"
 	if st != nil && st.UptimeSec > 0 {
-		title += " · 运行 " + humanDuration(time.Duration(st.UptimeSec)*time.Second)
+		win := "窗口 " + humanDuration(time.Duration(st.UptimeSec)*time.Second)
+		if t, err := time.Parse(time.RFC3339, st.Since); err == nil {
+			win += "（自 " + t.Local().Format("01-02 15:04") + "）"
+		}
+		title += " · " + win
 	}
 	lines = append(lines, title)
 

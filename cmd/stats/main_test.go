@@ -505,6 +505,7 @@ func TestPadAndTruncate(t *testing.T) {
 func TestBuildFrameStructure(t *testing.T) {
 	st := &statsResponse{
 		Enabled: true, UptimeSec: 5340,
+		Since:  "2026-09-14T20:43:52.1042102+08:00",
 		Total:  mkModel("(all)", 131, 0),
 		Models: []modelStat{mkModel("deepseek-v4.1-flash", 131, 0)},
 	}
@@ -513,8 +514,17 @@ func TestBuildFrameStructure(t *testing.T) {
 	if !strings.Contains(frame[0], "网关请求统计") {
 		t.Errorf("首行应为标题，得到 %q", frame[0])
 	}
-	if !strings.Contains(frame[0], "运行 1h29m") {
-		t.Errorf("标题应含运行时长，得到 %q", frame[0])
+	// 措辞必须是「窗口」而非「运行」：该时长来自持久化的 since（跨重启保留），
+	// 不是进程 uptime —— 写成"运行"会让用户误以为进程已跑这么久。
+	if !strings.Contains(frame[0], "窗口 1h29m") {
+		t.Errorf("标题应含统计窗口时长，得到 %q", frame[0])
+	}
+	if strings.Contains(frame[0], "运行") {
+		t.Errorf("标题不应出现「运行」（会被误读为进程 uptime），得到 %q", frame[0])
+	}
+	// 同时给出起始时刻，进一步消除歧义。
+	if !strings.Contains(frame[0], "自 09-14 20:43") {
+		t.Errorf("标题应含窗口起始时刻，得到 %q", frame[0])
 	}
 	if !strings.Contains(frame[len(frame)-1], "账号积分") {
 		t.Errorf("尾注应说明扣费单位，得到 %q", frame[len(frame)-1])
@@ -522,6 +532,26 @@ func TestBuildFrameStructure(t *testing.T) {
 	// 表体存在（含模型名）。
 	if !strings.Contains(strings.Join(frame, "\n"), "deepseek-v4.1-flash") {
 		t.Errorf("帧应含模型行:\n%s", strings.Join(frame, "\n"))
+	}
+}
+
+// TestBuildFrameTitleWithoutSince since 缺失或不可解析时只显示窗口时长，
+// 不应因解析失败而丢掉整个标题信息，也不应崩。
+func TestBuildFrameTitleWithoutSince(t *testing.T) {
+	cases := []string{"", "not-a-timestamp"}
+	for _, since := range cases {
+		st := &statsResponse{
+			Enabled: true, UptimeSec: 3600, Since: since,
+			Total:  mkModel("(all)", 1, 0),
+			Models: []modelStat{mkModel("m", 1, 0)},
+		}
+		frame := buildFrame(st, "requests", nil)
+		if !strings.Contains(frame[0], "窗口 1h0m") {
+			t.Errorf("since=%q 时仍应显示窗口时长，得到 %q", since, frame[0])
+		}
+		if strings.Contains(frame[0], "自 ") {
+			t.Errorf("since=%q 不可解析时不应出现起始时刻片段，得到 %q", since, frame[0])
+		}
 	}
 }
 
