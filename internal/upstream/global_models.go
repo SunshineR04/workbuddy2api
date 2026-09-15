@@ -16,9 +16,9 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// GlobalModelNames 国际版（global realm）模型名静态名单兜底（PLAN §7.2 附录 21 名）。
-// 只含模型名、不含倍率。探测失败 / 无 global 账号时直接输出此名单；
-// 探测成功时以其 "权威 21 名" 为基底，追加探测独有的模型名（去重）。
+// GlobalModelNames 国际版（global realm）历史静态名单（PLAN §7.2 附录 21 名）。
+// 纯动态化后**不再作为模型目录的基底/兜底**：/v1/models 只透出上游实际下发的模型，
+// 生产链路对本名单零引用。保留仅作历史对照（global e2e 观测日志差集参照）。
 var GlobalModelNames = []string{
 	"default-model",
 	"fast-model",
@@ -48,7 +48,8 @@ var GlobalModelNames = []string{
 // Mutex 内嵌，与 modelList 无并发读路径竞争（唯一读写点本文件内）。
 type fetchGlobalModelsCache struct {
 	sync.Mutex
-	names    []string // 成功缓存：探测 ∪ 静态名单（已去重）；nil = 未探测
+	names    []string    // 成功缓存：探测结果（已去重）；nil = 未探测/失败
+	infos    []ModelInfo // 成功缓存：探测对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
 	lastFail time.Time
 }
@@ -70,40 +71,58 @@ var globalModelsProbePaths = []string{
 
 // FetchGlobalModels 探测 global 账号的模型名目录并返回模型名列表（含 context 无关、无倍率）。
 //
-// 成功：探测结果 ∪ GlobalModelNames（去重，静态 21 为基底，探测独有追加），缓存 1h。
-// 失败（家族端点全非 2xx / 解析失败 / 空列表）：记 5min 负缓存，回落 GlobalModelNames。
-// 缓存/负缓存命中：直接返回，零上游调用。
+// 纯动态：成功返回探测结果（去重），缓存 1h；失败（家族端点全非 2xx / 解析失败 /
+// 空列表）记 5min 负缓存，返回 nil（无静态回落）。缓存/负缓存命中：直接返回，零上游调用。
 //
-// 调用方负责：① 仅在有 global 账号时调用（无则不探测）；
-// ② GlobalEnabled 关闭时（逃生门）不得调用——本方法由 globalOn(a) 内部兜底，若账号
-// 因开关回落 cn 则返回 nil（handler 侧回落静态名单，仍零探测）。
+// 调用方负责：仅在有 global 账号时调用（无则不探测）；GlobalEnabled 关闭时（逃生门）
+// 不得调用——本方法由 globalOn(a) 内部兜底，若账号因开关回落 cn 则返回 nil。
 func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
+	names, _ := c.fetchGlobalModelsOnce(a)
+	return names
+}
+
+// FetchGlobalModelInfos 探测 global 账号的模型目录并返回全字段 ModelInfo 列表
+// （global /v2 模型对象与 CN 同构，2026-09-15 真实账号 /v2 探测实证）。
+// 与 FetchGlobalModels 共享同一次探测与缓存（names + infos 一体落缓存）：
+// 对象形态 200 → 全字段条目；窄表形态 / 探测失败 / 负缓存 / 非 global 路由账号
+// → nil（调用方按 ID 名单输出裸条目，不编造字段）。
+// 账号因 GlobalEnabled 开关回落 cn 时不探测（globalOn 兜底，零上游调用）。
+func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
+	_, infos := c.fetchGlobalModelsOnce(a)
+	return infos
+}
+
+// fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
+// 纯动态：成功 = 探测结果去重（不与任何静态名单合并）；一切失败 = nil（不回落静态）。
+// infos 仅对象形态成功探测时非 nil。
+func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []ModelInfo) {
 	if !c.globalOn(a) {
-		// 逃生门兜底：账号不路由 global 上游 → 不探测，回落静态名单（零上游调用）。
-		return GlobalModelNames
+		// 逃生门兜底：账号不路由 global 上游 → 不探测（零上游调用）。
+		return nil, nil
 	}
 
 	c.globalModels.Lock()
 	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
-		out := c.globalModels.names
+		names, infos := c.globalModels.names, c.globalModels.infos
 		c.globalModels.Unlock()
-		return out
+		return names, infos
 	}
 	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
-		// 负缓存冷却期内：避免反复打上游，直接按失败处理（回落静态）。
+		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
 		c.globalModels.Unlock()
-		return GlobalModelNames
+		return nil, nil
 	}
 	c.globalModels.Unlock()
 
-	names, efforts, defaults, err := c.probeGlobalModels(a)
+	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
-		// 探测失败：负缓存 + 回落静态名单（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
+		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
 		c.globalModels.lastFail = time.Now()
 		c.globalModels.names = nil
+		c.globalModels.infos = nil
 		c.globalModels.Unlock()
-		return GlobalModelNames
+		return nil, nil
 	}
 	// global 域 effort 能力：探测下发的 supportedEfforts/defaultEffort 权威写入 global 桶
 	// （raw remote，不并入静态表——静态兜底在 prepareBody 的 globalEffortMap 与
@@ -112,16 +131,10 @@ func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
 		c.storeEfforts("global", efforts, defaults)
 	}
 
-	// 成功：静态名单为基底，追加探测独有（去重）。只取名字，倍率字段忽略。
-	seen := make(map[string]bool, len(GlobalModelNames)+len(names))
-	merged := make([]string, 0, len(GlobalModelNames)+len(names))
-	for _, id := range GlobalModelNames {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		merged = append(merged, id)
-	}
+	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
+	// 不注入 costTier（§3.D2 不变）。
+	seen := make(map[string]bool, len(names))
+	merged := make([]string, 0, len(names))
 	for _, id := range names {
 		if id == "" || seen[id] {
 			continue
@@ -132,93 +145,81 @@ func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
 
 	c.globalModels.Lock()
 	c.globalModels.names = merged
+	c.globalModels.infos = infos
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
 	c.globalModels.Unlock()
-	return merged
+	return merged, infos
 }
 
-// probeGlobalModels 按候选路径序列发起一次探测，返回模型名列表（未去重、已滤 disabled）
-// 及解析出的 effort 能力桶（supportedEfforts/defaultEffort，可为空）。家族端点全部非 2xx
-// （等幂探活）才返回错误。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, efforts map[string][]string, defaults map[string]string, err error) {
+// probeGlobalModels 按候选路径序列发起一次探测，返回模型名列表（未去重、已滤 disabled）、
+// 全字段 ModelInfo（对象形态；窄表为 nil）及解析出的 effort 能力桶
+// （supportedEfforts/defaultEffort，可为空）。家族端点全部非 2xx（等幂探活）才返回错误。
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	var lastErr error
 	for _, path := range globalModelsProbePaths {
-		names, efforts, defaults, err = c.globalModelsOnce(a, path)
+		names, infos, efforts, defaults, err = c.globalModelsOnce(a, path)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return names, efforts, defaults, nil
+		return names, infos, efforts, defaults, nil
 	}
-	return nil, nil, nil, lastErr
+	return nil, nil, nil, nil, lastErr
 }
 
-// globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, efforts, defaults, nil)；否则 (nil,...,err)。
-func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, map[string][]string, map[string]string, error) {
+// globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, efforts, defaults, nil)；否则 (nil,...,err)。
+func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelInfo, map[string][]string, map[string]string, error) {
 	url := c.chatBase(a) + path // 按 realm 切 base：global 账号 → global base
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	c.CommonHeaders(req, a) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（探测负缓存走 lastFail，不罚号）。
-		return nil, nil, nil, fmt.Errorf("read body: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, nil, fmt.Errorf("global models status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, nil, nil, nil, fmt.Errorf("global models status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	return parseGlobalModelNames(raw)
-}
-
-// globalModelEntry 对象形态单条模型字段（含 reasoning 档位桶，对齐 CN FetchModels 解析口径）。
-type globalModelEntry struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Disabled bool   `json:"disabled"`
-	// 上游或仅下发 reasoning.effort（单档字符串）而非 supportedEfforts 数组——两形态都读，
-	// 数组优先。缺 reasoning / 缺档位 → 桶为空（调用方不写、回落静态兜底）。
-	Reasoning struct {
-		Effort           string   `json:"effort"`
-		DefaultEffort    string   `json:"defaultEffort"`
-		SupportedEfforts []string `json:"supportedEfforts"`
-	} `json:"reasoning"`
 }
 
 // parseGlobalModelNames 容忍两种形态解析模型名：
 //   - 对象数组：data.models[].id/.name（id 优先），disabled 剔除；
 //   - 窄表：data 为字符串数组。
 //
-// 对象形态额外解析 reasoning.supportedEfforts / defaultEffort（P0：global 域 effort 探测，
-// 解析不到时调用方回落 staticEffortCap 兜底表——prepareBody 的 globalEffortMap 与
-// /v1/models 的 EffortListing）。窄表形态无元数据 → 桶为空。
+// 对象形态与 CN 模型对象同构（dynModelEntry 共用解析口径），额外产出全字段 ModelInfo
+// 与 reasoning.supportedEfforts / defaultEffort（P0：global 域 effort 探测，解析不到时
+// 调用方回落 staticEffortCap 兜底表——prepareBody 的 globalEffortMap 与 /v1/models 的
+// EffortListing）。窄表形态无元数据 → infos/桶为空。
 //
 // 解析成功但名单为空 → 返回错误（调用方回落静态，等价"该端点没给全"）。
-func parseGlobalModelNames(raw []byte) (names []string, efforts map[string][]string, defaults map[string]string, err error) {
+func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	var env struct {
 		Code int             `json:"code"`
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, nil, nil, fmt.Errorf("global models parse: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, nil, nil, fmt.Errorf("global models code=%d", env.Code)
+		return nil, nil, nil, nil, fmt.Errorf("global models code=%d", env.Code)
 	}
 	trimmed := strings.TrimSpace(string(env.Data))
 	if strings.HasPrefix(trimmed, "[") {
-		// 窄表形态：data 为字符串数组（无 effort 元数据）。
+		// 窄表形态：data 为字符串数组（无 effort 元数据、无对象字段 → infos nil）。
 		var arr []string
 		if err := json.Unmarshal(env.Data, &arr); err != nil {
-			return nil, nil, nil, fmt.Errorf("global models parse (narrow): %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("global models parse (narrow): %w", err)
 		}
 		out := make([]string, 0, len(arr))
 		for _, id := range arr {
@@ -227,18 +228,20 @@ func parseGlobalModelNames(raw []byte) (names []string, efforts map[string][]str
 			}
 		}
 		if len(out) == 0 {
-			return nil, nil, nil, fmt.Errorf("global models empty list")
+			return nil, nil, nil, nil, fmt.Errorf("global models empty list")
 		}
-		return out, nil, nil, nil
+		return out, nil, nil, nil, nil
 	}
-	// 对象形态：data.models[].id/.name（id 优先），disabled 剔除，附带 parsing reasoning。
+	// 对象形态：data.models[].id/.name（id 优先），disabled 剔除，全字段落 ModelInfo。
+	// dynModelEntry 与 CN FetchModels 共用（两域模型对象同构），零解析口径漂移。
 	var obj struct {
-		Models []globalModelEntry `json:"models"`
+		Models []dynModelEntry `json:"models"`
 	}
 	if err := json.Unmarshal(env.Data, &obj); err != nil {
-		return nil, nil, nil, fmt.Errorf("global models parse: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
 	}
 	out := make([]string, 0, len(obj.Models))
+	infos = make([]ModelInfo, 0, len(obj.Models))
 	for _, m := range obj.Models {
 		id := m.ID
 		if id == "" {
@@ -248,6 +251,9 @@ func parseGlobalModelNames(raw []byte) (names []string, efforts map[string][]str
 			continue
 		}
 		out = append(out, id)
+		mi := m.modelInfo()
+		mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
+		infos = append(infos, mi)
 		// effort 桶：supportedEfforts 数组优先；缺数组但 reasoning.effort 单档非空 → 视作单档表。
 		if len(m.Reasoning.SupportedEfforts) > 0 {
 			if efforts == nil {
@@ -268,7 +274,7 @@ func parseGlobalModelNames(raw []byte) (names []string, efforts map[string][]str
 		}
 	}
 	if len(out) == 0 {
-		return nil, nil, nil, fmt.Errorf("global models empty list")
+		return nil, nil, nil, nil, fmt.Errorf("global models empty list")
 	}
-	return out, efforts, defaults, nil
+	return out, infos, efforts, defaults, nil
 }

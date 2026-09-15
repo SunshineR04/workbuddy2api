@@ -51,9 +51,10 @@ func globalModelsClient(t *testing.T, srv *httptest.Server) *Client {
 	}
 }
 
-// TestFetchGlobalModelsProbeMergesAndHeaders 探测命中：走 global base + /v2 路径（家族首选）
-// + Bearer 鉴权头，结果为「探测 ∪ 静态名单」去重（重复 id 只出现一次，disabled 不入）。
-func TestFetchGlobalModelsProbeMergesAndHeaders(t *testing.T) {
+// TestFetchGlobalModelsProbePureDynamic 探测命中：走 global base + /v2 路径（家族首选）
+// + Bearer 鉴权头，结果为纯探测名单去重（重复 id 只出现一次，disabled 不入），
+// 不合并任何静态名单（探测未返回的 default-model 等历史名单成员不出现）。
+func TestFetchGlobalModelsProbePureDynamic(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
@@ -81,24 +82,25 @@ func TestFetchGlobalModelsProbeMergesAndHeaders(t *testing.T) {
 	if gotAuthz != "Bearer at" {
 		t.Errorf("probe authz=%q want Bearer at", gotAuthz)
 	}
-	// 合并去重：静态 21 全在；probe-only-x 追加；gpt-5.4 去重为 1；disabled-y 不入。
+	// 纯动态去重：gpt-5.4 去重为 1；probe-only-x 保留；disabled-y 不入；
+	// 静态历史名单成员（default-model 等）不出现（未探测到即无）。
 	counts := map[string]int{}
-	wantHas := []string{"gpt-5.4", "probe-only-x", "default-model", "kimi-k2.6", "kimi-k3", "deep-model"}
 	for _, id := range got {
 		counts[id]++
 	}
-	for _, id := range wantHas {
-		if counts[id] != 1 {
-			t.Errorf("model %q appears %d times want 1 (overlay+dedupe)", id, counts[id])
-		}
+	if counts["gpt-5.4"] != 1 || counts["probe-only-x"] != 1 {
+		t.Errorf("probed models dedupe failed: %v", counts)
 	}
 	if _, ok := counts["disabled-y"]; ok {
 		t.Errorf("disabled model disabled-y should not appear")
 	}
+	if _, ok := counts["default-model"]; ok {
+		t.Errorf("static legacy name default-model must not appear (pure dynamic)")
+	}
 }
 
-// TestFetchGlobalModelsFallbackStaticOnFailure 探测家族全失败（v2+console 均 500）→ 回落静态名单。
-func TestFetchGlobalModelsFallbackStaticOnFailure(t *testing.T) {
+// TestFetchGlobalModelsFailureReturnsNil 探测家族全失败（v2+console 均 500）→ 空名单（无静态回落）。
+func TestFetchGlobalModelsFailureReturnsNil(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
@@ -113,8 +115,8 @@ func TestFetchGlobalModelsFallbackStaticOnFailure(t *testing.T) {
 	if len(calls) != 2 || calls[0] != "/v2/enterprises/personal/models" || calls[1] != "/console/enterprises/personal/models" {
 		t.Fatalf("fallback calls=%v want [/v2/..., /console/...]", calls)
 	}
-	if len(got) != len(GlobalModelNames) || !reflect.DeepEqual(got, GlobalModelNames) {
-		t.Errorf("fallback result != GlobalModelNames (static)")
+	if len(got) != 0 {
+		t.Errorf("failure result=%v want empty (no static fallback)", got)
 	}
 }
 
@@ -141,7 +143,7 @@ func TestFetchGlobalModelsCache(t *testing.T) {
 	}
 }
 
-// TestFetchGlobalModelsNegativeCache 失败后进入负缓存：冷却期内再次调用零新请求（仍回静态）。
+// TestFetchGlobalModelsNegativeCache 失败后进入负缓存：冷却期内再次调用零新请求（仍空名单）。
 func TestFetchGlobalModelsNegativeCache(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -159,8 +161,8 @@ func TestFetchGlobalModelsNegativeCache(t *testing.T) {
 	if len(calls) != 2 {
 		t.Errorf("negative cache: probe calls=%d want 2 (family attempted once)", len(calls))
 	}
-	if !reflect.DeepEqual(first, second) || !reflect.DeepEqual(second, GlobalModelNames) {
-		t.Errorf("negative-cache result should be static GlobalModelNames")
+	if len(first) != 0 || len(second) != 0 {
+		t.Errorf("negative-cache results should be empty (no static fallback): %v %v", first, second)
 	}
 }
 
@@ -181,7 +183,7 @@ func TestFetchGlobalModelsParseNarrowTable(t *testing.T) {
 	for _, id := range got {
 		counts[id]++
 	}
-	if counts["gpt-5.4"] != 1 || counts["narrow-only"] != 1 || counts["default-model"] != 1 {
-		t.Errorf("narrow-table merge not as expected: %v", counts)
+	if counts["gpt-5.4"] != 1 || counts["narrow-only"] != 1 || counts["default-model"] != 0 {
+		t.Errorf("narrow-table parse not as expected (pure dynamic): %v", counts)
 	}
 }

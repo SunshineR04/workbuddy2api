@@ -130,7 +130,7 @@ func TestGlobalModelsOnceReadError(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return readErrResp(200, `{"code":0,"data":{"models":[{"id":"m`), nil
 	})
-	_, _, _, err := c.globalModelsOnce(globalAuth(), "/v2/enterprises/personal/models")
+	_, _, _, _, err := c.globalModelsOnce(globalAuth(), "/v2/enterprises/personal/models")
 	if err == nil {
 		t.Fatal("want error on probe body read failure, got nil")
 	}

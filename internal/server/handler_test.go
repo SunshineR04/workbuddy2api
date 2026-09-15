@@ -1028,6 +1028,7 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	}
 }
 
+// TestModelsEndpoint 纯动态：无健康上游（Upstream 指向不可达 base）→ 空列表 + 200。
 func TestModelsEndpoint(t *testing.T) {
 	resetModelsCache()
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
@@ -1043,17 +1044,8 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) < 5 {
-		t.Errorf("models count=%d", len(data))
-	}
-	found := false
-	for _, m := range data {
-		if m.(map[string]any)["id"] == "cn:glm-5.2" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("cn:glm-5.2 missing (static models prefixed)")
+	if len(data) != 0 {
+		t.Errorf("models count=%d want 0 (pure dynamic, fetch failed)", len(data))
 	}
 }
 
@@ -1120,7 +1112,8 @@ func TestModelsDynamic(t *testing.T) {
 	}
 }
 
-func TestModelsDynamicFallsBackToStatic(t *testing.T) {
+// TestModelsDynamicFetchFailEmpty 纯动态：上游 500 → 空列表（无静态回退）。
+func TestModelsDynamicFetchFailEmpty(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -1142,9 +1135,9 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	// 回退静态表（≥5 个）
-	if len(data) < 5 {
-		t.Errorf("static fallback failed: %d", len(data))
+	// 纯动态：失败 → 空
+	if len(data) != 0 {
+		t.Errorf("fetch failure should yield empty list (no static fallback): %d", len(data))
 	}
 }
 
@@ -1169,7 +1162,7 @@ func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
-		t.Fatalf("code=%d (static fallback)", rec.Code)
+		t.Fatalf("code=%d (empty list on failure)", rec.Code)
 	}
 	st, _ := p.Status("u1")
 	// 熔断器零观测：不喂 fails（breaker_fails=0）、不熔断（Cooling=false）、
@@ -1209,7 +1202,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	// 连续 3 次请求，上游持续 500 → 只应触发 1 次 fetch（负缓存生效），
-	// 其余走静态 fallback（仍返回 200）。
+	// 其余直接空列表（纯动态，仍返回 200）。
 	for i := 0; i < 3; i++ {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1285,9 +1278,9 @@ func TestModelsDynamicZeroContextFallback(t *testing.T) {
 	}
 }
 
-// TestModelsDynamicUnderscoresStaticAndPreservesBodies 动态成功时优先动态结果（连 headers
-// 字段一并保留原样），失败才回退静态表——两条路径都产出 valid models 响应。
-func TestModelsDynamicUnderscoresStaticAndPreservesBodies(t *testing.T) {
+// TestModelsDynamicPreservesBodies 动态成功时产出全字段条目（连 headers 字段一并保留原样）；
+// 失败路径产出空列表（由 TestModelsDynamicFetchFailEmpty 覆盖）。
+func TestModelsDynamicPreservesBodies(t *testing.T) {
 	resetModelsCache()
 
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1323,10 +1316,6 @@ func TestModelsDynamicUnderscoresStaticAndPreservesBodies(t *testing.T) {
 		t.Errorf("/v1/models must include cn:dyn-only when dynamic fetch succeeds: %v", resp.Data)
 	}
 
-	// 失败路径仍 return 静态表（既有行为由 TestModelsDynamicFallsBackToStatic 覆盖）。
-	if len(resp.Data) == 0 {
-		t.Fatal("static fallback produced empty list")
-	}
 }
 
 func TestAPIKeyAuth(t *testing.T) {

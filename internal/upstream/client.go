@@ -463,8 +463,8 @@ type Client struct {
 	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
 	defaultEfforts map[string]map[string]string
 
-	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
-	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
+	// globalModels 缓存 global 模型名目录纯动态探测结果（1h TTL + 5min 负缓存），
+	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
@@ -922,7 +922,10 @@ func (c *Client) chatPaths(a *auth.Auth) []string {
 	return []string{chatCompletionsPath}
 }
 
-// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
+// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
+// CN /console 与 global /v2 的模型对象同构（2026-09-15 global 真实账号 /v2 探测
+// 实证，字段集与任务书 hy3 样本一致），故共用此结构；上游省略的字段保持零值，
+// /v1/models 侧按「空值省略」透出（不编造）。
 type ModelInfo struct {
 	ID             string
 	Name           string
@@ -931,6 +934,71 @@ type ModelInfo struct {
 	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
 	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
 	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+
+	// 以下为模型目录全字段补齐（任务书 models-full-fields）：
+	Description       string   // descriptionZh 中文描述
+	Credits           string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
+	Tags              []string // tags 模型标签（含 badge:限时免费 等）
+	Vendor            string   // vendor 厂商标识
+	IsDefault         bool     // isDefault 是否默认模型
+	SupportsReasoning bool     // supportsReasoning 是否支持推理
+	SupportsToolCall  bool     // supportsToolCall 是否支持工具调用
+	OnlyReasoning     bool     // onlyReasoning 是否纯推理模型
+	MaxAllowedSize    int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
+	ReasoningEffort   string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
+	ReasoningSummary  string   // reasoning.summary 推理摘要模式（如 "auto"）
+}
+
+// dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
+// FetchModels 与 global_models.go 的探测共用。iconUrl/descriptionEn/生成参数等
+// 按「不透出」原则不解析（任务书 §不透出字段）。
+type dynModelEntry struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Description     string   `json:"descriptionZh"`
+	Credits         string   `json:"credits"`
+	Tags            []string `json:"tags"`
+	Vendor          string   `json:"vendor"`
+	IsDefault       bool     `json:"isDefault"`
+	MaxInputTokens  int64    `json:"maxInputTokens"`
+	MaxOutputTokens int64    `json:"maxOutputTokens"`
+	MaxAllowedSize  int64    `json:"maxAllowedSize"`
+	Disabled        bool     `json:"disabled"`
+	SupportsImages  bool     `json:"supportsImages"`
+	SupportsReason  bool     `json:"supportsReasoning"`
+	SupportsTool    bool     `json:"supportsToolCall"`
+	OnlyReasoning   bool     `json:"onlyReasoning"`
+	Reasoning       struct {
+		Effort           string   `json:"effort"`
+		Summary          string   `json:"summary"`
+		DefaultEffort    string   `json:"defaultEffort"`
+		SupportedEfforts []string `json:"supportedEfforts"`
+	} `json:"reasoning"`
+}
+
+// modelInfo 按解析条目构造 ModelInfo（dynEntry→ModelInfo 映射的单一事实来源，
+// CN FetchModels 与 global 探测共用，杜绝两域映射漂移）。
+func (m dynModelEntry) modelInfo() ModelInfo {
+	return ModelInfo{
+		ID:                m.ID,
+		Name:              m.Name,
+		ContextWindow:     m.MaxInputTokens,
+		MaxTokens:         m.MaxOutputTokens,
+		Efforts:           m.Reasoning.SupportedEfforts,
+		DefaultEffort:     m.Reasoning.DefaultEffort,
+		SupportsImages:    m.SupportsImages,
+		Description:       m.Description,
+		Credits:           m.Credits,
+		Tags:              m.Tags,
+		Vendor:            m.Vendor,
+		IsDefault:         m.IsDefault,
+		SupportsReasoning: m.SupportsReason,
+		SupportsToolCall:  m.SupportsTool,
+		OnlyReasoning:     m.OnlyReasoning,
+		MaxAllowedSize:    m.MaxAllowedSize,
+		ReasoningEffort:   m.Reasoning.Effort,
+		ReasoningSummary:  m.Reasoning.Summary,
+	}
 }
 
 // 模型目录端点路径常量（按 realm 切）：
@@ -1002,20 +1070,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	var env struct {
 		Code int `json:"code"`
 		Data struct {
-			Models []struct {
-				ID              string   `json:"id"`
-				Name            string   `json:"name"`
-				MaxInputTokens  int64    `json:"maxInputTokens"`
-				MaxOutputTokens int64    `json:"maxOutputTokens"`
-				Disabled        bool     `json:"disabled"`
-				SupportsImages  bool     `json:"supportsImages"`
-				Tags            []string `json:"tags"`
-				Reasoning       struct {
-					Effort           string   `json:"effort"`
-					DefaultEffort    string   `json:"defaultEffort"`
-					SupportedEfforts []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
+			Models []dynModelEntry `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
 				Models []string `json:"models"`
@@ -1041,27 +1096,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
 	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
 	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
-	type dynEntry struct {
-		ID              string
-		Name            string
-		MaxInputTokens  int64
-		MaxOutputTokens int64
-		Disabled        bool
-		Efforts         []string
-		DefaultEffort   string
-		SupportsImages  bool
-	}
-	dynMap := make(map[string]dynEntry, len(env.Data.Models))
+	dynMap := make(map[string]dynModelEntry, len(env.Data.Models))
 	for _, m := range env.Data.Models {
 		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
 			continue
 		}
-		dynMap[m.ID] = dynEntry{
-			ID: m.ID, Name: m.Name,
-			MaxInputTokens: m.MaxInputTokens, MaxOutputTokens: m.MaxOutputTokens,
-			Disabled: m.Disabled, Efforts: m.Reasoning.SupportedEfforts,
-			DefaultEffort: m.Reasoning.DefaultEffort, SupportsImages: m.SupportsImages,
-		}
+		dynMap[m.ID] = m
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
@@ -1069,15 +1109,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if !ok || m.Disabled {
 			continue
 		}
-		out = append(out, ModelInfo{
-			ID:             m.ID,
-			Name:           m.Name,
-			ContextWindow:  m.MaxInputTokens,
-			MaxTokens:      m.MaxOutputTokens,
-			Efforts:        m.Efforts,
-			DefaultEffort:  m.DefaultEffort,
-			SupportsImages: m.SupportsImages,
-		})
+		out = append(out, m.modelInfo())
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
