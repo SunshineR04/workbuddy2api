@@ -13,6 +13,12 @@ data/
 /wb2api
 /signin_bin
 
+# Windows 本地构建产物：start.ps1 / stats.ps1 / login.ps1 把编译好的 exe 落在这里
+# （上游无此目录 —— .sh 与 Dockerfile 都是现场编译、用完即弃）。
+# 同样锚定根目录：裸写 "bin/" 会连任意深度的 bin/ 一起忽略，将来上游若新增
+# 包含源码的 xxx/bin/，就会被静默忽略。
+/bin/
+
 # Config with secrets (use config.example.json)
 config.json
 
