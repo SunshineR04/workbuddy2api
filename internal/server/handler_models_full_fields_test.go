@@ -153,9 +153,10 @@ func TestModelListFullFieldsGlobalRich(t *testing.T) {
 		t.Errorf("ctx=%v maxout=%v want 192000/64000", entry["context_length"], entry["max_output_tokens"])
 	}
 	// 一次 modelList 只触发一次探测（names 与 infos 共享缓存）。
+	// v3-config-merge：单次探测 = v3/config + /v2 企业路并发 = 2 个请求。
 	cnt, _, _, _ := cf.snapshot()
-	if cnt != 1 {
-		t.Errorf("probe calls=%d want 1 (names+infos shared cache)", cnt)
+	if cnt != 2 {
+		t.Errorf("probe calls=%d want 2 (v3 + v2 concurrent, names+infos shared cache)", cnt)
 	}
 }
 

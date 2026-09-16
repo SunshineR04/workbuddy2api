@@ -721,6 +721,35 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 	}
 }
 
+// TestStreamMidStreamErrorFramePassthrough error-passthrough：SSE 流中带上游 error 帧
+// （如 6004 限流/审核拦截）时，该帧**原样透传**（error 字段不被 normalizeFrame 白名单
+// 剥掉），message/code/requestId 原文可见；且干净帧仍规范化透传、恰好一个 [DONE]。
+func TestStreamMidStreamErrorFramePassthrough(t *testing.T) {
+	const errFrame = `{"error":{"message":"您的使用量已超出频率限制","code":"6004","requestId":"req-rl-42"}}`
+	raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		"data: " + errFrame + "\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	// 错误帧原文存续：message/code/requestId 都在。
+	if !strings.Contains(body, "您的使用量已超出频率限制") ||
+		!strings.Contains(body, `"code":"6004"`) ||
+		!strings.Contains(body, `"requestId":"req-rl-42"`) {
+		t.Fatalf("error frame must pass through verbatim (message/code/requestId): %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, body)
+	}
+	// 干净帧仍被规范化透传（error 帧不计入规范化路径，不影响普通帧）。
+	if !strings.Contains(body, `"role":"assistant"`) || !strings.Contains(body, `"content":"hello"`) {
+		t.Errorf("clean frame missing or not normalized: %q", body)
+	}
+}
+
 // TestStreamGarbageAfterDone 校验 DONE 之后的垃圾帧不出现在响应里。
 func TestStreamGarbageAfterDone(t *testing.T) {
 	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n" +

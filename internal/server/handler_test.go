@@ -23,8 +23,10 @@ import (
 
 // TestMain 默认关闭聊天表格日志（chatLogEnabled=false），消除 go test 期间的 stdout 噪音。
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
+// 同时把轮转退避基数置 0（backoff.go：测试不等退避；退避界断言测试临时恢复）。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
+	rotateBackoffBase = 0
 	os.Exit(m.Run())
 }
 
@@ -261,7 +263,7 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 // 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
 func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
@@ -273,6 +275,84 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
 		t.Errorf("503 message should carry upstream 11101 info: %s", body)
+	}
+	if !strings.Contains(body, "req-xyz-777") {
+		t.Errorf("503 message should carry upstream requestId: %s", body)
+	}
+}
+
+// TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID 验收（error-passthrough）：
+// 构造上游错误响应（含 code/msg/requestId，非 429 状态码）经 handler 后，客户端可见的
+// error.message 必须等于上游 body 原文（code/msg/requestId 原样保留），而非网关固定文案
+// （任务书验收 2：透视可见真实上游错误）。
+func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
+	const raw = `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, raw, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	// error.message 必须等于上游原文（原样，非固定文案/非重建 JSON）。
+	if e.Error.Message != raw {
+		t.Errorf("message=%q want raw upstream body passthrough %q", e.Error.Message, raw)
+	}
+	if !strings.Contains(e.Error.Message, "11101") ||
+		!strings.Contains(e.Error.Message, "Unmarshal chat params failed") ||
+		!strings.Contains(e.Error.Message, "req-xyz-777") {
+		t.Errorf("message must preserve code/msg/requestId: %s", e.Error.Message)
+	}
+	if strings.Contains(e.Error.Message, "no_healthy_account") || strings.Contains(e.Error.Message, "all accounts are temporarily unavailable") {
+		t.Errorf("message must NOT be the fixed local scheduling text: %s", e.Error.Message)
+	}
+}
+
+// TestChatLocalNoAccountKeepsOwnMessage 验收（本地调度类错误）：池中无可用账号（本地
+// 调度失败，非上游返回）时，错误保留网关自有文案 no_healthy_account（任务书：内部调度
+// 类错误保留自有文案——本地没有上游原文可透传，不编造）。
+func TestChatLocalNoAccountKeepsOwnMessage(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		t.Fatal("no upstream call expected for empty pool")
+		return 200, "", false
+	})
+	// 空池：Pick 返回 nil → 本地调度失败，无上游错误可透传。
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d want 503", rec.Code)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if e.Error.Code != "no_healthy_account" {
+		t.Errorf("code=%q want no_healthy_account (local scheduling error)", e.Error.Code)
+	}
+	if !strings.Contains(e.Error.Message, "all accounts are temporarily unavailable") {
+		t.Errorf("message=%q want fixed local scheduling message (no upstream to passthrough)", e.Error.Message)
 	}
 }
 
@@ -534,7 +614,7 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "glm-5.2")
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "glm-5.2", nil)
 		st, _ := p.Status("u1")
 		if !st.Disabled {
 			t.Fatalf("11140 应硬禁用: %+v", st)
@@ -552,7 +632,7 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated"}}}`, "glm-5.2")
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated"}}}`, "glm-5.2", nil)
 		st, _ := p.Status("u1")
 		if st.Disabled {
 			t.Fatalf("14017 不应禁用: %+v", st)
@@ -576,7 +656,7 @@ func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	// 第 1 次：进入冷却，streak=1，600s（固定基数，无重置时间）。
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
 	st, _ := p.Status("u1")
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("call 1: 应为 soft_rate 冷却: %+v", st)
@@ -591,7 +671,7 @@ func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
 	// 冷却中重复触发（兜底探测）→ 不翻倍、不推进 streak。
 	before := st.CoolRemaining
 	for n := 0; n < 3; n++ {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
 	}
 	st, _ = p.Status("u1")
 	if st.SoftStreak != 1 {
@@ -616,7 +696,7 @@ func TestApplyErrorPolicySoftRateResetTime11140(t *testing.T) {
 	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
 	body := `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`
 
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3")
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3", nil)
 	st, ok := p.Status("u1")
 	if !ok {
 		t.Fatal("u1 missing")
@@ -648,7 +728,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
 	for i := 0; i < 3; i++ {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
@@ -1193,9 +1273,13 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
+	// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config，计数须并发安全。
+	var mu sync.Mutex
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		mu.Lock()
 		calls++
+		mu.Unlock()
 		return 500, `boom`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -1210,8 +1294,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	if calls != 1 {
-		t.Errorf("want 1 fetch, got %d", calls)
+	if calls != 2 {
+		// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config 两路 = 2 个上游请求。
+		t.Errorf("want 2 upstream calls (single fetch, enterprise + v3), got %d", calls)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1223,8 +1308,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 2 {
-		t.Errorf("want 2 fetch after cooldown, got %d", calls)
+	if calls != 4 {
+		// 第二次 fetch 同样两路并发：累计 4 个上游请求。
+		t.Errorf("want 4 upstream calls after cooldown (2nd fetch, enterprise + v3), got %d", calls)
 	}
 }
 
@@ -1570,13 +1656,13 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 	// 未命中测试账号（u2 也被限流）也会带台账——但只断言 u1（被选中的号）即验证端到端。
 }
 
-// TestChatAllRateLimitedNormalizes429 端到端回归本次重构根因症状：全部账号都命中上游
-// 限流（200/400 + 速限文案，非 429 状态码）时，末端错误必须是规范化的 OpenAI 风格
-// 429 rate_limit_exceeded，而不是 503 + 原样透传上游原文
-// "The model provider is rate-limiting requests..."（不应泄露账号/上游内部措辞，也不应
-// 误报 503 让客户端以为网关挂了，错误应为"限流→等待重试"语义）。
-func TestChatAllRateLimitedNormalizes429(t *testing.T) {
-	const raw = `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`
+// TestChatAllRateLimitedPassesThroughUpstream 端到端（error-passthrough）：全部账号都命中
+// 上游限流（400 + 速限文案，非 429 状态码）时，末端错误映射为 OpenAI 风格
+// 429 rate_limit_exceeded（限流语义保持），但 error.message **透传上游 body 原文**——
+// code/msg/requestId 原样保留，客户端必须能看到真实上游错误以便排查，不再规范化成
+// 固定文案（任务书：上游错误码/账号语义允许泄露给客户端）。
+func TestChatAllRateLimitedPassesThroughUpstream(t *testing.T) {
+	const raw = `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again.","requestId":"req-abc-123"}`
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, raw, false
 	})
@@ -1603,8 +1689,12 @@ func TestChatAllRateLimitedNormalizes429(t *testing.T) {
 	if e.Error.Code != "rate_limit_exceeded" {
 		t.Errorf("code=%q want rate_limit_exceeded", e.Error.Code)
 	}
-	if strings.Contains(rec.Body.String(), "rate-limiting requests") || strings.Contains(rec.Body.String(), "11140") {
-		t.Errorf("normalized error must not leak upstream raw body: %s", rec.Body)
+	// error.message 必须等于上游原文（含 code/msg/requestId），非固定文案。
+	if e.Error.Message != raw {
+		t.Errorf("message=%q want passthrough of upstream raw body %q", e.Error.Message, raw)
+	}
+	if !strings.Contains(e.Error.Message, "req-abc-123") {
+		t.Errorf("requestId must be preserved in message: %s", e.Error.Message)
 	}
 	// 两个号都被限流冷却（换号过程完整跑完仍无健康号）。
 	for _, uid := range []string{"u1", "u2"} {
@@ -1891,13 +1981,9 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	if !strings.Contains(body, `"code":"content_blocked"`) {
 		t.Errorf("want content_blocked code: %s", body)
 	}
-	if !strings.Contains(body, "触发网站风控违禁词") || !strings.Contains(body, "规则[违禁词]") {
-		t.Errorf("want firewall message with keyword, not error code: %s", body)
-	}
-	for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
-		if strings.Contains(strings.ToLower(body), leak) {
-			t.Errorf("must not leak %q: %s", leak, body)
-		}
+	// error-passthrough：message 透传上游 body 原文（code/msg/requestId 原样），非网关固定文案。
+	if !strings.Contains(body, "blocked by security policy") || !strings.Contains(body, "11128") {
+		t.Errorf("want upstream raw body passthrough in message: %s", body)
 	}
 	if h.degrade.Active() {
 		t.Error("degrade should NOT be active in custom mode")
@@ -1905,7 +1991,8 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 }
 
 // TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError），
-// 且 passthrough 降级重试后第二次仍拦 → 立即 400 content_blocked（不轮转、不泄露上游错误码）。
+// 且 passthrough 降级重试后第二次仍拦 → 立即 400 content_blocked（不轮转），
+// message 透传上游 code/msg 原文（error-passthrough）。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -1969,7 +2056,12 @@ func TestContentBlockedSecondHitReturns400(t *testing.T) {
 	if !assertJSONErrorCode(t, body, "content_blocked") {
 		return
 	}
-	for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy"} {
+	// error-passthrough：message 透传上游 body 原文（含 code 11128），任务书授权
+	// 上游错误码对客户端可见。仍不泄露账号 UID/冷却/本地调度身份。
+	if !strings.Contains(body, "11128") || !strings.Contains(body, "blocked by security policy") {
+		t.Errorf("want upstream raw body in message (11128 + policy text): %s", body)
+	}
+	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "u1", "u2"} {
 		if strings.Contains(strings.ToLower(body), leak) {
 			t.Errorf("must not leak %q: %s", leak, body)
 		}
@@ -1984,7 +2076,8 @@ func TestContentBlockedSecondHitReturns400(t *testing.T) {
 }
 
 // TestContentBlockedReturnsFirewallMessage 内容拦截最终失败时回 400 content_blocked，
-// 文案为网关防火墙口径（含分类关键词），不含账号/冷却/upstream/错误码前缀。
+// message 透传上游 body 原文（含 code 11128 与审核文案），不含账号/冷却/本地前缀
+// （error-passthrough：上游错误码允许可见，账号 UID 与本地调度信息仍不暴露）。
 func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
 	calls := 0
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -2021,11 +2114,13 @@ func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
 	if envelope.Error.Code != "content_blocked" {
 		t.Errorf("code=%q want content_blocked", envelope.Error.Code)
 	}
-	want := "触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[nsfw]，已被拦截。请修改内容后重试。"
-	if envelope.Error.Message != want {
-		t.Errorf("message=%q want %q", envelope.Error.Message, want)
+	// message 为上游 body 原文（非网关固定文案）：含 code 11128 与审核原文。
+	if !strings.Contains(envelope.Error.Message, "11128") ||
+		!strings.Contains(envelope.Error.Message, "blocked by security policy") ||
+		!strings.Contains(envelope.Error.Message, "NSFW material") {
+		t.Errorf("message=%q 应为上游 body 原文（含 11128 与审核文案）", envelope.Error.Message)
 	}
-	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "11128"} {
+	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "u1", "u2"} {
 		if strings.Contains(strings.ToLower(rec.Body.String()), leak) {
 			t.Errorf("must not leak %q: %s", leak, rec.Body)
 		}

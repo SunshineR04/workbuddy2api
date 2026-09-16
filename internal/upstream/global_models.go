@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -60,10 +61,12 @@ const (
 	globalModelsFailCooldown = 5 * time.Minute
 )
 
-// globalModelsProbePaths global 模型目录端点候选序列（按 realm 切 base，路径"家族"）：
+// globalModelsProbePaths global 企业模型目录端点候选序列（按 realm 切 base，路径"家族"）：
 // /v2 家族优先（PR #20 实测 /v2/enterprises/personal/models 200 含完整模型表），
 // /console 作 fallback（同域旧路径，或 500）。参考 PLAN v1 §2.2 分歧③ 与
 // rockswang/wild-work PR #20 实测结论：console 路径在 global 上非 200 → 先 /v2。
+// v3-config-merge 后该家族降为企业补充路（/v3/config 为主路，与家族并发探测；
+// gpt-5.3-codex 等家族独有模型经此进并集）。
 var globalModelsProbePaths = []string{
 	"/v2/enterprises/personal/models",
 	"/console/enterprises/personal/models",
@@ -152,20 +155,139 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	return merged, infos
 }
 
-// probeGlobalModels 按候选路径序列发起一次探测，返回模型名列表（未去重、已滤 disabled）、
-// 全字段 ModelInfo（对象形态；窄表为 nil）及解析出的 effort 能力桶
-// （supportedEfforts/defaultEffort，可为空）。家族端点全部非 2xx（等幂探活）才返回错误。
+// probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge）：
+// /v3/config（主）与企业端点家族（/v2 → /console 兜底，补缺）**并发**探测后并集合并。
+// 返回模型名列表（已合并、未再去重——去重在 fetchGlobalModelsOnce）、全字段
+// ModelInfo（对象形态；窄表为 nil）及 effort 能力桶（supportedEfforts/defaultEffort，
+// 可为空）。合并口径：v3 条目为主（credits 等字段以 v3 为准），企业端点只补 v3 缺失的
+// 模型 id（如 gpt-5.3-codex 只在 /v2，作为补充进并集）；去重 key = 模型 id，输出顺序
+// 稳定（v3 原序在前、企业端点补充项在后）。两路全失败才返回错误（等价原「家族端点全
+// 非 2xx」负缓存语义）；单路失败降级为另一路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
-	var lastErr error
-	for _, path := range globalModelsProbePaths {
-		names, infos, efforts, defaults, err = c.globalModelsOnce(a, path)
-		if err != nil {
-			lastErr = err
+	type probeResult struct {
+		names    []string
+		infos    []ModelInfo
+		efforts  map[string][]string
+		defaults map[string]string
+		err      error
+	}
+	v3Ch := make(chan probeResult, 1)
+	enterpriseCh := make(chan probeResult, 1)
+	go func() {
+		names, infos, efforts, defaults, perr := c.globalModelsOnce(a, v3ConfigPath)
+		v3Ch <- probeResult{names, infos, efforts, defaults, perr}
+	}()
+	go func() {
+		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
+		var lastErr error
+		for _, path := range globalModelsProbePaths {
+			names, infos, efforts, defaults, perr := c.globalModelsOnce(a, path)
+			if perr != nil {
+				lastErr = perr
+				continue
+			}
+			enterpriseCh <- probeResult{names, infos, efforts, defaults, nil}
+			return
+		}
+		enterpriseCh <- probeResult{err: lastErr}
+	}()
+	v3 := <-v3Ch
+	enterprise := <-enterpriseCh
+
+	if v3.err != nil && enterprise.err != nil {
+		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
+		return nil, nil, nil, nil, v3.err
+	}
+	if v3.err != nil {
+		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
+		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+		return enterprise.names, enterprise.infos, enterprise.efforts, enterprise.defaults, nil
+	}
+	if enterprise.err != nil {
+		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+		return v3.names, v3.infos, v3.efforts, v3.defaults, nil
+	}
+	// 两路皆成功：v3 为主、企业端点补缺合并。
+	names, infos = mergeGlobalCatalog(v3.names, v3.infos, enterprise.names, enterprise.infos)
+	efforts = mergeEffortBuckets(v3.efforts, enterprise.efforts)
+	defaults = mergeEffortDefaults(v3.defaults, enterprise.defaults)
+	return names, infos, efforts, defaults, nil
+}
+
+// mergeGlobalCatalog 两路合并（v3 主、企业补缺）：names 按 id 去重（v3 原序在前、
+// 企业端点补充项在其原序后追加——稳定输出）；infos 同步合并（v3 条目字段权威，
+// 企业端点条目只在 id 缺失时进并集，其 credits 为 v2 原值）。
+// 窄表形态（infos nil）时保持 nil——无对象字段不编造。
+func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, secondaryNames []string, secondaryInfos []ModelInfo) (names []string, infos []ModelInfo) {
+	if len(secondaryNames) == 0 {
+		return primaryNames, primaryInfos
+	}
+	seen := make(map[string]bool, len(primaryNames)+len(secondaryNames))
+	out := make([]string, 0, len(primaryNames)+len(secondaryNames))
+	for _, id := range primaryNames {
+		if id == "" || seen[id] {
 			continue
 		}
-		return names, infos, efforts, defaults, nil
+		seen[id] = true
+		out = append(out, id)
 	}
-	return nil, nil, nil, nil, lastErr
+	var outInfos []ModelInfo
+	if primaryInfos != nil {
+		outInfos = make([]ModelInfo, 0, len(primaryInfos)+len(secondaryInfos))
+		for _, mi := range primaryInfos {
+			outInfos = append(outInfos, mi)
+		}
+	}
+	for _, id := range secondaryNames {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		// 窄表企业响应（secondaryInfos nil / 超出条目数）时该 id 无对象字段，
+		// infos 保持原样（调用方按 id 名单输出裸条目，不编造字段）。
+		for _, mi := range secondaryInfos {
+			if mi.ID == id {
+				outInfos = append(outInfos, mi)
+				break
+			}
+		}
+	}
+	return out, outInfos
+}
+
+// mergeEffortBuckets 合并两路 effort 桶：主路（v3）权威，企业端点只补主路缺失的模型档位。
+func mergeEffortBuckets(primary, secondary map[string][]string) map[string][]string {
+	if len(secondary) == 0 {
+		return primary
+	}
+	out := primary
+	if out == nil {
+		out = make(map[string][]string, len(secondary))
+	}
+	for id, v := range secondary {
+		if _, ok := out[id]; !ok {
+			out[id] = v
+		}
+	}
+	return out
+}
+
+// mergeEffortDefaults 合并两路 defaultEffort：主路（v3）权威，企业端点只补缺失。
+func mergeEffortDefaults(primary, secondary map[string]string) map[string]string {
+	if len(secondary) == 0 {
+		return primary
+	}
+	out := primary
+	if out == nil {
+		out = make(map[string]string, len(secondary))
+	}
+	for id, v := range secondary {
+		if _, ok := out[id]; !ok {
+			out[id] = v
+		}
+	}
+	return out
 }
 
 // globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, efforts, defaults, nil)；否则 (nil,...,err)。

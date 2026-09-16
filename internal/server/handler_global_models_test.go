@@ -140,10 +140,14 @@ func TestModelListTwoFamilies(t *testing.T) {
 		t.Errorf("global models dedupe failed: gpt-5.4 count=%d", countOf(globIDs, "gpt-5.4"))
 	}
 
-	// 探测走 global base（httptest Host）+ Bearer 鉴权头 + /v2 家族首选。
+	// 探测走 global base（httptest Host）+ Bearer 鉴权头；v3-config-merge 后单次探测
+	// = /v3/config + /v2 企业路并发（cnt=2，path 记录的是最近一次——两路之一）。
 	cnt, path, authz, host := cf.snapshot()
-	if cnt == 0 || path != "/v2/enterprises/personal/models" {
-		t.Errorf("probe path=%q cnt=%d want /v2/enterprises/personal/models", path, cnt)
+	if cnt != 2 {
+		t.Errorf("probe cnt=%d want 2 (v3/config + v2 enterprise, concurrent)", cnt)
+	}
+	if path != "/v2/enterprises/personal/models" && path != "/v3/config" {
+		t.Errorf("probe path=%q want one of [/v2/enterprises/personal/models /v3/config]", path)
 	}
 	if authz != "Bearer at_gl" {
 		t.Errorf("probe authz=%q want Bearer at_gl", authz)
@@ -221,8 +225,9 @@ func TestModelListProbeCacheWithinTTL(t *testing.T) {
 
 	h.modelList()
 	cnt1, _, _, _ := cf.snapshot()
-	if cnt1 != 1 {
-		t.Fatalf("first probe calls=%d want 1", cnt1)
+	// v3-config-merge：单次探测 = v3/config + /v2 企业路并发 = 2 个请求。
+	if cnt1 != 2 {
+		t.Fatalf("first probe calls=%d want 2 (v3 + v2, concurrent)", cnt1)
 	}
 	h.modelList()
 	cnt2, _, _, _ := cf.snapshot()

@@ -229,8 +229,10 @@ func TestChatStreamContextCompileGuarantee(t *testing.T) {
 
 	_, status, _, err := c.ChatStreamContext(context.Background(),
 		globalAuth(), []byte(`{"model":"m"}`), "", ChatMeta{ConversationRequestID: "req-p01-c"})
-	if err != nil || status != 404 {
-		// 旧不可达代码若被错误激活会返回 (nil,0,nil,nil)：err==nil 且 status==0 吞掉失败。
-		t.Fatalf("both paths 404: want status=404 err=nil-ish, got status=%d err=%v", status, err)
+	// 404 错误路径现在返回已分类 *Error（Kind=ErrNotFound）；旧「不可达代码返回
+	// (nil,0,nil,nil) 吞错」的形态是 status=0 + err=nil，二者均不再出现。
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrNotFound || status != 404 {
+		t.Fatalf("both paths 404: want status=404 + *Error{not_found}, got status=%d err=%v", status, err)
 	}
 }

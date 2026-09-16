@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -13,13 +14,17 @@ import (
 
 // globalModelsSrv 返回一段 global 模型目录探测服务：record 逐条记录请求路径与鉴权头，
 // respond 按路径决定响应。用于断言探测的 base/路径/鉴权头与缓存/回落行为。
+// v3-config-merge 后探测两路并发，记录须并发安全（mu 保护）。
 func globalModelsSrv(t *testing.T, calls *[]string, authz *string, respond func(path string) (int, string)) *httptest.Server {
 	t.Helper()
+	var mu sync.Mutex
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		*calls = append(*calls, r.URL.Path)
 		if authz != nil {
 			*authz = r.Header.Get("Authorization")
 		}
+		mu.Unlock()
 		status, body := respond(r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -51,9 +56,9 @@ func globalModelsClient(t *testing.T, srv *httptest.Server) *Client {
 	}
 }
 
-// TestFetchGlobalModelsProbePureDynamic 探测命中：走 global base + /v2 路径（家族首选）
-// + Bearer 鉴权头，结果为纯探测名单去重（重复 id 只出现一次，disabled 不入），
-// 不合并任何静态名单（探测未返回的 default-model 等历史名单成员不出现）。
+// TestFetchGlobalModelsProbePureDynamic 探测命中：走 global base + /v3/config（主）与
+// /v2（企业补充）并发双路 + Bearer 鉴权头，结果为纯探测名单去重（重复 id 只出现一次，
+// disabled 不入），不合并任何静态名单（探测未返回的 default-model 等历史名单成员不出现）。
 func TestFetchGlobalModelsProbePureDynamic(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -76,14 +81,15 @@ func TestFetchGlobalModelsProbePureDynamic(t *testing.T) {
 	if !strings.HasPrefix(srv.URL, "http://") {
 		t.Fatal("unexpected srv.URL")
 	}
-	if len(calls) != 1 || calls[0] != "/v2/enterprises/personal/models" {
-		t.Fatalf("probe calls=%v want [/v2/enterprises/personal/models] (v2 家族首选)", calls)
+	// v3-config-merge：/v3/config（主）+ /v2（企业首选）各一次，v2 200 即不打 /console。
+	if len(calls) != 2 || !containsStr(calls, "/v3/config") || !containsStr(calls, "/v2/enterprises/personal/models") {
+		t.Fatalf("probe calls=%v want [/v3/config /v2/enterprises/personal/models]", calls)
 	}
 	if gotAuthz != "Bearer at" {
 		t.Errorf("probe authz=%q want Bearer at", gotAuthz)
 	}
-	// 纯动态去重：gpt-5.4 去重为 1；probe-only-x 保留；disabled-y 不入；
-	// 静态历史名单成员（default-model 等）不出现（未探测到即无）。
+	// 纯动态去重：gpt-5.4 去重为 1（两路同 id 以 v3 条目为主，不重复）；probe-only-x 保留；
+	// disabled-y 不入；静态历史名单成员（default-model 等）不出现（未探测到即无）。
 	counts := map[string]int{}
 	for _, id := range got {
 		counts[id]++
@@ -99,7 +105,8 @@ func TestFetchGlobalModelsProbePureDynamic(t *testing.T) {
 	}
 }
 
-// TestFetchGlobalModelsFailureReturnsNil 探测家族全失败（v2+console 均 500）→ 空名单（无静态回落）。
+// TestFetchGlobalModelsFailureReturnsNil 探测两路全失败（v3 + v2 + console 均 500）→
+// 空名单（无静态回落）。
 func TestFetchGlobalModelsFailureReturnsNil(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -112,8 +119,11 @@ func TestFetchGlobalModelsFailureReturnsNil(t *testing.T) {
 
 	got := globalModelsClient(t, srv).FetchGlobalModels(globalAcct())
 
-	if len(calls) != 2 || calls[0] != "/v2/enterprises/personal/models" || calls[1] != "/console/enterprises/personal/models" {
-		t.Fatalf("fallback calls=%v want [/v2/..., /console/...]", calls)
+	// v3 一路 + 企业家族两路（v2 500 → console 500）= 3 个请求。
+	if len(calls) != 3 || !containsStr(calls, "/v3/config") ||
+		!containsStr(calls, "/v2/enterprises/personal/models") ||
+		!containsStr(calls, "/console/enterprises/personal/models") {
+		t.Fatalf("fallback calls=%v want [/v3/config /v2/... /console/...]", calls)
 	}
 	if len(got) != 0 {
 		t.Errorf("failure result=%v want empty (no static fallback)", got)
@@ -135,8 +145,8 @@ func TestFetchGlobalModelsCache(t *testing.T) {
 	first := c.FetchGlobalModels(globalAcct())
 	second := c.FetchGlobalModels(globalAcct())
 
-	if len(calls) != 1 {
-		t.Errorf("cache: probe calls=%d want 1 (second hit cache)", len(calls))
+	if len(calls) != 2 {
+		t.Errorf("cache: probe calls=%d want 2 (v3+v2 once, second hit cache)", len(calls))
 	}
 	if !reflect.DeepEqual(first, second) {
 		t.Errorf("cached result differs from first")
@@ -158,8 +168,9 @@ func TestFetchGlobalModelsNegativeCache(t *testing.T) {
 	first := c.FetchGlobalModels(globalAcct())
 	second := c.FetchGlobalModels(globalAcct())
 
-	if len(calls) != 2 {
-		t.Errorf("negative cache: probe calls=%d want 2 (family attempted once)", len(calls))
+	// 首次 = v3 + 企业家族（v2+console）= 3 个请求；负缓存内二次零新请求。
+	if len(calls) != 3 {
+		t.Errorf("negative cache: probe calls=%d want 3 (v3 + family attempted once)", len(calls))
 	}
 	if len(first) != 0 || len(second) != 0 {
 		t.Errorf("negative-cache results should be empty (no static fallback): %v %v", first, second)

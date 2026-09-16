@@ -344,12 +344,34 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
 	firstID := ""
 
+	// writeRaw 原样写出一帧（绕过 normalizeFrame）并 flush。上游 error 帧（error-passthrough）
+	// 与空流错误帧需保留 error 字段，不能被白名单剥掉，故经此写出。
+	writeRaw := func(payload string) error {
+		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+			return werr
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
+			// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
+			// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
+			// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
+			// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
+			if _, hasErr := obj["error"]; hasErr {
+				if werr := writeRaw(payload); werr != nil {
+					return 0, werr
+				}
+				return 1, nil
+			}
 			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 			stripToolCallNames(obj, toolCallSeen)
 			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
@@ -375,18 +397,6 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 			fl.Flush()
 		}
 		return valid, nil
-	}
-
-	// writeRaw 原样写出一帧（绕过 normalizeFrame）并 flush。空流错误帧需保留 error 字段，
-	// 不能被白名单剥掉，故不经 writeFrame 规范化。
-	writeRaw := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
 	}
 
 	br := bufio.NewReaderSize(r, 64*1024)

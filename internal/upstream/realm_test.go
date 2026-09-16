@@ -3,6 +3,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -232,8 +233,11 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 
 	c := globalTestClient(t, chatSrv, billSrv)
 	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
-	if err != nil {
-		t.Fatalf("chat 500: %v", err)
+	// 5xx 错误路径现在返回**已分类的** *Error（Kind=ErrServer，见 ChatStreamContext
+	// 注释）：err 非 nil 是新契约，传输层错误（非 *Error）仍按抖动处理。
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrServer {
+		t.Fatalf("chat 500: want classified *Error{server}, got %v", err)
 	}
 	if status != 500 {
 		t.Errorf("status=%d want 500", status)
