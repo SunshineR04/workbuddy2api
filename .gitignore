@@ -21,6 +21,10 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+# 备份副本同样含 api_key 明文：上面那条是精确匹配，盖不住 config.json.bak-* 这类变体，
+# 而这几个备份恰恰是仓库里最容易误提交的敏感文件。
+config.json.bak
+config.json.bak-*
 
 # Build artifacts
 *.tmp
@@ -36,6 +40,18 @@ LOOP.md
 PLAN.md
 SPEC.md
 docs/
+
+# Windows 本地运维脚本。逐个列名而不用 *.ps1：stats.ps1 是仓库跟踪文件，
+# 通配符会让它的后续改动与新文件落入两种不同规则，语义混乱。
+/start.ps1
+/stop.ps1
+/login.ps1
+
+# 本机临时数据 / 日志 / 基准脚本
+/effort_bench.py
+/wb_models.json
+/offpeak_probes.log
+/cmd/travelchk/
 
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
