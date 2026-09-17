@@ -6,7 +6,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -30,9 +29,6 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权
 	MaxRotate int    // 单请求最多换号次数，默认 3
-	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
-	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
-	MaxBodyBytes int64
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -76,6 +72,11 @@ const wafCooldownBase = 60 * time.Second
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
 const ServiceName = "workbuddy2api"
 
+// dumpReqMinBytes WB2A_DUMP_REQ 调试落盘的"大请求"固定阈值（4MB）。原判断是
+// 「超过 max_body_mb 上限一半」，max_body_mb 移除后改为固定值，语义不变：
+// 小探针（{"input":"hi"} 之类）不落盘，避免覆盖真正要看的对话请求。
+const dumpReqMinBytes = 4 << 20
+
 // Handler 主路由。
 type Handler struct {
 	cfg     Config
@@ -99,9 +100,6 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
-	}
-	if cfg.MaxBodyBytes <= 0 {
-		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -494,25 +492,20 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
-	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
-	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
-	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
-	limit := h.cfg.MaxBodyBytes
-	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	// 请求体无大小上限（max_body_mb 已移除）：完整读入，超限类问题交由上游自然返回
+	// 错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断防御语义保留在
+	// 读错误路径——移除预拦截后，截断只可能来自客户端自己断流，读 body 出错就地 400，
+	// 不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	if int64(len(body)) > limit {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
-			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", limit>>20))
-		return
-	}
 	// 调试开关：设置 WB2A_DUMP_REQ 即把上游侧收到的原始请求体落盘，供离线二分定位指纹命中行。
 	// 仅在排查上游指纹拦截时开启；不设置时零开销、不落盘。
-	// 只落"大请求"（超过上限一半）：小探针（{"input":"hi"} 之类）会覆盖掉真正要看的对话请求。
-	if os.Getenv("WB2A_DUMP_REQ") != "" && len(body)*2 >= int(limit) {
+	// 只落"大请求"（≥4MB 固定阈值，原 max_body_mb/2 语义的接替）：小探针
+	// （{"input":"hi"} 之类）会覆盖掉真正要看的对话请求。
+	if os.Getenv("WB2A_DUMP_REQ") != "" && len(body) >= dumpReqMinBytes {
 		if err := os.WriteFile("/app/data/last_request.json", body, 0o600); err != nil {
 			log.Printf("ERR: [server] dump req: %v", err)
 		}

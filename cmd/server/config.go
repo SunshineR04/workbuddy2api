@@ -21,11 +21,8 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 
 	Server struct {
-		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
-		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
-		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
-		// 0/负数视为非法 → normalize 回落默认并记录。
-		MaxBodyMB int `json:"max_body_mb"`
+		// max_body_mb 已退役（上游 BREAKING）：请求体大小上限整体移除，旧配置中的
+		// 该键因 JSON 未知字段而自然忽略，不报错、无 deprecation 噪音。
 
 		// MetricsEnabled 是否采集按模型的请求统计（默认 true）。
 		MetricsEnabled bool `json:"metrics_enabled"`
@@ -175,7 +172,6 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
 	c.Server.MetricsEnabled = true
 	c.Server.MetricsFile = "./data/metrics.json"
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
@@ -249,11 +245,6 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
-	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Server.MaxBodyMB = n
-		}
-	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -316,11 +307,6 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
-	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 8MB，用户以为"不限"，
-	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
-	if c.Server.MaxBodyMB <= 0 {
-		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
-	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
