@@ -1,8 +1,9 @@
-// 四因子加权体系优化的 RED 测试（任务：.claude/tasks/weight-optimization.md）。
+// 加权体系优化的 RED 测试（任务：.claude/tasks/weight-optimization.md）。
 // 覆盖五项修复：P1-A credits 签到外回写、P1-B weightOf/maxCredits 统一口径、
-// P2-C 成功率 EMA 衰减、P2-D costTier 缓存（以行为回归覆盖）、P3-E 防御修补
+// P2-C 成功率 EMA 衰减（**因子已删**，7 个 EMA 测试随 success-ema-review §4
+// 一并清理，此处只留删除后不变量：旧 state.json 的 success_ema/error_ema 字段
+// 读取无害）、P2-D costTier 缓存（以行为回归覆盖）、P3-E 防御修补
 // （creditsExpiring 恢复钳制、粘性路径 usedSeq 推进、洗牌 epsilon、total<=0 死分支）。
-// GREEN 之前这些测试全部/大部分失败（RED），修复后全绿。
 package pool
 
 import (
@@ -193,144 +194,45 @@ func TestWeightOfMaxCreditsPassedVerbatim(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// P2-C：成功率 EMA 衰减
+// P2-C：成功率 EMA 已删（success-ema-review §4 方案 a）
 // ---------------------------------------------------------------------------
 
-// TestSuccessEMAConvergesToHigh 连续成功 → successEMA 趋近 1（比率随观测上升）。
-func TestSuccessEMAConvergesToHigh(t *testing.T) {
-	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	var prev float64
-	for i := 0; i < 100; i++ {
-		p.NoteSuccess("u1")
-	}
-	p.mu.RLock()
-	prev = p.byUID["u1"].successEMA
-	p.mu.RUnlock()
-	if prev < 0.95 {
-		t.Errorf("100 次连续成功后 successEMA=%.4f want >= 0.95", prev)
-	}
-}
-
-// TestSuccessEMAReduces 历史高成功率 → 持续失败逐步下降（不终身冻结在高位）。
-func TestSuccessEMAReduces(t *testing.T) {
-	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	for i := 0; i < 100; i++ {
-		p.NoteSuccess("u1")
-	}
-	for i := 0; i < 100; i++ {
-		p.NoteError("u1")
-	}
-	p.mu.RLock()
-	e := p.byUID["u1"]
-	ema, errEMA := e.successEMA, e.errorEMA
-	p.mu.RUnlock()
-	rate := ema / (ema + errEMA)
-	if rate > 0.5 {
-		t.Errorf("100 失败后 EMA 成功率=%.4f want <= 0.5（历史故障不应永久压低/抬高）", rate)
-	}
-}
-
-// TestSuccessEMARecoverable 历史故障后连续成功 → 成功率逐步恢复（衰减语义的核心验收：
-// 旧终身累计口径下 errTotal 是分母的永久部分，恢复不动；EMA 下恢复）。
-func TestSuccessEMARecoverable(t *testing.T) {
-	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	for i := 0; i < 20; i++ {
-		p.NoteError("u1")
-	}
-	// 拍个快照（旧口径比率）
-	snap := func() float64 {
-		p.mu.RLock()
-		e := p.byUID["u1"]
-		ema, errEMA := e.successEMA, e.errorEMA
-		p.mu.RUnlock()
-		if ema+errEMA == 0 {
-			return 1.5 // 无观测 → 中性
-		}
-		return ema / (ema + errEMA)
-	}
-	before := snap()
-	for i := 0; i < 20; i++ {
-		p.NoteSuccess("u1")
-	}
-	after := snap()
-	if after <= before {
-		t.Errorf("20 次连续成功后 EMA 成功率应显著恢复: before=%.4f after=%.4f", before, after)
-	}
-	if after < 0.5 {
-		t.Errorf("20 次连续成功后 EMA 成功率=%.4f want >= 0.5（α=0.1 时恢复已充分）", after)
-	}
-}
-
-// TestSuccessEMAPersists EMA 落盘 + 重载恢复（state.json 新字段 success_ema/error_ema）。
-func TestSuccessEMAPersists(t *testing.T) {
+// TestSuccessEMALegacyFieldsIgnored 旧 state.json 带 success_ema/error_ema 字段
+// → 加载不报错、不迁移（JSON 多余键自然丢弃，entry 无对应字段即零行为）。
+// 语义升级理由：因子已删，旧字段是无害遗留（同 err_count 兼容先例）。
+func TestSuccessEMALegacyFieldsIgnored(t *testing.T) {
 	dir := t.TempDir()
 	fp := stateFilePath(t, dir)
+	writeState(t, fp, `{"accounts":{"u1":{"credits":100,"success_count":8,"err_total":2,"success_ema":0.9,"error_ema":0.1}}}`)
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	for i := 0; i < 10; i++ {
-		p.NoteSuccess("u1")
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("账号应恢复")
 	}
-	p.NoteError("u1")
-	p.Flush()
-	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
-	p2.mu.RLock()
-	ema, errEMA := p2.byUID["u1"].successEMA, p2.byUID["u1"].errorEMA
-	p2.mu.RUnlock()
-	if ema <= 0 || errEMA <= 0 {
-		t.Errorf("EMA 未持久化/未恢复: successEMA=%.4f errorEMA=%.4f", ema, errEMA)
+	if st.Credits != 100 || st.SuccessCount != 8 || st.ErrTotal != 2 {
+		t.Errorf("旧 EMA 字段存在时其余字段应正常恢复: %+v", st)
 	}
 }
 
-// TestSuccessEMALegacyBackfill 旧 state.json 无 EMA 字段 → 从 successCount/errTotal 反推初始值。
-func TestSuccessEMALegacyBackfill(t *testing.T) {
-	dir := t.TempDir()
-	fp := stateFilePath(t, dir)
-	// 旧格式：无 success_ema/error_ema，只有 success_count/err_total。
-	writeState(t, fp, `{"accounts":{"u1":{"credits":100,"success_count":8,"err_total":2}}}`)
-	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
-	p.mu.RLock()
-	e := p.byUID["u1"]
-	ema, errEMA := e.successEMA, e.errorEMA
-	p.mu.RUnlock()
-	if ema+errEMA == 0 {
-		t.Fatal("旧 state.json 应反推 EMA 初始值（非零）")
-	}
-	// 反推口径：8/10 成功 → 比率 0.8。归一化实现自由，但比率应接近 0.8。
-	rate := ema / (ema + errEMA)
-	if rate < 0.75 || rate > 0.85 {
-		t.Errorf("反推 EMA 成功率=%.4f want ~0.8（8 成功 2 错误）", rate)
-	}
-}
-
-// TestWeightOfUsesEMARate weightOf 第 3 因子改用 EMA 比率而非终身累计比率。
-// 旧口径下 1 成功 9 错误 → 比率 0.1；EMA α=0.1 下连续 NoteError 9 次后 NoteSuccess
-// 1 次：errorEMA≈0.61，successEMA=0.1 → 比率 ≈0.14 —— 数值上差异太小，不好断言。
-// 改用决定性构造：A 号 1 成功 9 错误（终身比率 0.1）；B 号 100 成功 + 900 错误
-// 后 100 成功（终身比率 ~0.18 但近期全成功）。EMA 下 B 比率高得多 → weightOf(B) >
-// weightOf(A)。旧口径下 B(0.18) 仍略高于 A(0.1)，但差距悬殊度完全不同——
-// 断言 B 权重显著高于 A（EMA 恢复语义）。
-func TestWeightOfUsesEMARate(t *testing.T) {
+// TestWeightOfThreeFactorsNoSuccess weightOf 三因子化后的核心不变量：
+// 成败计数（successCount/errTotal）不影响权重——同 credits/idle/lastUsed 的
+// 两号，一个全成功一个全失败，weightOf 必须相等（原 ×3 因子已删）。
+// 语义升级理由：因子删除后「成功率影响选号」的旧断言（TestWeightLowSuccessRate
+// 的原形态）不再成立，改为锁定反向不变量。
+func TestWeightOfThreeFactorsNoSuccess(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "a"})
-	p.Add(&auth.Auth{UID: "b"})
-	p.NoteSuccess("a")
-	for i := 0; i < 9; i++ {
-		p.NoteError("a")
+	p.Add(&auth.Auth{UID: "good"})
+	p.Add(&auth.Auth{UID: "bad"})
+	p.SetCredits("good", 100)
+	p.SetCredits("bad", 100)
+	for i := 0; i < 20; i++ {
+		p.NoteSuccess("good")
+		p.NoteError("bad")
 	}
-	for i := 0; i < 900; i++ {
-		p.NoteError("b")
-	}
-	for i := 0; i < 100; i++ {
-		p.NoteSuccess("b")
-	}
-	wA, wB := p.entryWeight("a"), p.entryWeight("b")
-	if wB <= wA*1.05 {
-		t.Errorf("EMA 口径下近期恢复的 b 应显著高于持续混失败的 a: a=%.3f b=%.3f", wA, wB)
+	wGood, wBad := p.entryWeight("good"), p.entryWeight("bad")
+	if wGood != wBad {
+		t.Errorf("因子删除后成败计数不应影响权重: good=%.3f bad=%.3f", wGood, wBad)
 	}
 }
 
@@ -462,3 +364,41 @@ func writeState(t *testing.T, fp, content string) {
 
 // pickWeightedScale 暴露定点放大常数给测试对齐（P1-B 断言定点值用）。
 const pickWeightedScale = 1_000_000
+
+// TestFallbackEarliestExpiryAdvancesUsedSeq 全冷却兜底选号
+// （pickEarliestExpiryLocked）同样推进 usedSeq/pickSeq。
+//
+// entry.usedSeq 的契约是「每次被选中时取 p.pickSeq 自增值」（entry.go），pick() 正常
+// 路径与粘性命中（PickByUIDForModel，见上面 TestStickyPickAdvancesUsedSeq）都已遵守。
+// 兜底路径此前只写 lastUsed 就 return：被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
+// LRU 兜底（按 usedSeq 取最旧，pick.go）眼里永远是「最旧」，刚被用过就被立刻再选——
+// 防集中/防惊群失效，且与同一函数里已更新 lastUsed 的事实自相矛盾。
+func TestFallbackEarliestExpiryAdvancesUsedSeq(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "late"})
+	p.Add(&auth.Auth{UID: "early"})
+	// 两个都软冷却（全冷却 → 走兜底）；early 更早到期 → 兜底选 early。
+	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
+	p.Cooldown("early", CoolSoft, time.Hour, "x")
+
+	got := p.Pick("")
+	if got == nil || got.UID != "early" {
+		t.Fatalf("全冷却兜底应选最早到期的 early, got %+v", got)
+	}
+
+	p.mu.RLock()
+	seqEarly := p.byUID["early"].usedSeq
+	seqLate := p.byUID["late"].usedSeq
+	pickSeq := p.pickSeq
+	p.mu.RUnlock()
+
+	if seqEarly == 0 {
+		t.Errorf("兜底选号未推进 usedSeq: early=%d（兜底也是选中，违反 entry.usedSeq 契约「每次被选中时取 p.pickSeq 自增值」）", seqEarly)
+	}
+	if seqEarly != pickSeq {
+		t.Errorf("兜底推进的 usedSeq 应等于 pickSeq: early=%d pickSeq=%d", seqEarly, pickSeq)
+	}
+	if seqEarly <= seqLate {
+		t.Errorf("兜底被选中的 early usedSeq=%d 应高于未被选中的 late=%d（否则 LRU 兜底误判其为最旧）", seqEarly, seqLate)
+	}
+}

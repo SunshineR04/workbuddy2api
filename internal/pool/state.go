@@ -3,10 +3,12 @@
 package pool
 
 import (
+	"log"
 	"sort"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 )
 
 // Disable 永久禁用（session 死亡 / 账号级授权封禁），需人工重登后手工恢复或文件替换。
@@ -90,15 +92,14 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
-// NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal，
-// 并拉高 errorEMA（成功率权重的衰减口径）。达到 breakerThreshold 触发熔断（指数
-// 退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
+// NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal
+// （仅状态展示；原成功率 EMA 已删，此处不再喂）。达到 breakerThreshold 触发熔断
+// （指数退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
 func (p *Pool) NoteError(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
-		e.errorEMA += (1 - e.errorEMA) * successAlpha
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
@@ -107,8 +108,9 @@ func (p *Pool) NoteError(uid string) {
 
 // ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
 // DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
-// handler_cost_test / global_e2e_test 断言账本内容。跨包（internal/server）
-// 测试引用，迁 export_test.go 不可行（对包外不可见）。
+// handler_cost_test / global_e2e_test 断言账本内容（账本内容现经 state.json
+// 持久化，但 /status 透出走 statusOf 的只读遍历，不经本方法）。跨包
+// （internal/server）测试引用，迁 export_test.go 不可行（对包外不可见）。
 // 无观测或观测过期（modelCostTTL）时 ok=false。
 func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 	p.mu.RLock()
@@ -131,8 +133,11 @@ func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 // 记进去会污染账本。
 //
 // 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
-// 账本仅内存态——成本随上游活动（限免期/夜间免费/折扣）变化，持久化旧值
-// 反而是脏数据；重启后重新学习，代价只是前几次请求无偏好。
+// 账本持久化到 state.json（stateAccount.ModelCosts，P1-anti-monopoly）：重启后
+// 成本知识保留，限免/夜间免费的跨重启窗口不再重新付学费探测；落盘/恢复均按
+// modelCostTTL 惰性过滤——陈旧价格（时段性优惠）不跨 TTL 复活。
+// 限免结束事件：tier 0 观测（per1k≤0）被 credit>0 观测覆盖时打一条明确日志
+// （运维据此知道"免费午餐结束了"），判定在写入口做、只看覆盖前值。
 func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if uid == "" || model == "" || tokens <= 0 {
 		return
@@ -150,7 +155,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	// P1-A credits 签到外回写：credit 是本次请求的**消耗量**（上游 usage.credit，
 	// handler 侧 stats.Credit()/usageCreditTotal），不是剩余余额。顺手扣减 credits
-	// 与 creditsExpiring，让四因子里的两个余额因子随消耗实时收敛——旧口径只在
+	// 与 creditsExpiring，让三因子里的两个余额因子随消耗实时收敛——旧口径只在
 	// 签到（每天 09:00/21:00 两次）刷新，两次签到之间（最长 12h）高消耗号持续
 	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
 	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
@@ -176,18 +181,28 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if !seen {
 		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
 	} else {
+		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
+		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束，
+		// EMA 混合后单价转正，下一轮选号即降 tier 2。打一条日志让运维看得见
+		// 「免费午餐结束」这一关键状态迁移。
+		if prev.CostPer1k <= 0 && per1k > 0 {
+			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+		}
 		e.modelCost[model] = modelCostEntry{
 			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
 			LastSeen:  time.Now(),
 			Samples:   prev.Samples + 1,
 		}
 	}
+	p.dirty.Store(true) // 账本已持久化（P1-anti-monopoly）：写入口统一置脏
 }
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
+// 连败降权（issue #114）同样按「成功是恢复的最强证据」清零：consecutiveFails 归零、
+// degradeUntil 清空——成功即回池，不等降权到期（与 NoteSuccess 清 breakerUntil 同口径）。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
 // 冷却（Cooldown/reviveCoolingLocked）清除。
@@ -196,13 +211,14 @@ func (p *Pool) NoteSuccess(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.successCount++
-		e.successEMA += (1 - e.successEMA) * successAlpha
 		e.lastSuccess = time.Now()
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.consecutiveFails = 0
+		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
 	}
 }
@@ -413,16 +429,23 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
+		// 成本台账（P1-anti-monopoly）：每模型一行（modelCost 内 TTL 未过期的
+		// 条目），运维据此自查「为什么总选它」；只读遍历零风险，过期即消失。
+		ModelCosts: p.modelCostsStatusLocked(e, now),
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
-		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
+		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
+		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
+		Cooling: now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
 		Reason:            reason,
 		Disabled:          e.disabled,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		LastSuccessTime:   e.lastSuccess,
 		LastErrTime:       e.lastErr,
+		ConsecutiveFails:  e.consecutiveFails,
+		DegradeUntil:      e.degradeUntil,
 		Until:             e.until,
 		SoftStreak:        e.softStreak,
 		InFlight:          int(e.inFlight.Load()),
@@ -435,18 +458,28 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。口径与 Cooling 判定一致：
-		// 取 until 与 breakerUntil 中更远的截止（发现 5——熔断冷却的号原实现只算
-		// until，显示"冷却中却 0 秒恢复"；BreakerUntil 虽单独透出，两口径不一致
-		// 误导排查）。两者都过期不会进入本分支（Cooling=false）。
+		// 取 until / breakerUntil / degradeUntil 中更远的截止（发现 5——熔断冷却的号
+		// 原实现只算 until，显示"冷却中却 0 秒恢复"；BreakerUntil 虽单独透出，两口径
+		// 不一致误导排查）。全部过期不会进入本分支（Cooling=false）。
 		remain := time.Until(e.until)
 		if b := time.Until(e.breakerUntil); b > remain {
 			remain = b
+		}
+		if d := time.Until(e.degradeUntil); d > remain {
+			remain = d
 		}
 		st.CoolRemaining = int64(remain.Seconds() + 0.999)
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
 		st.CoolKind = e.coolKind.String()
+		// 纯降权形态（无生效的 until/熔断）时 reason 取连败文案：降权由 NoteFailures
+		// 触发，不写 until/reason（coolKind 也不是它写的），运维在 /status 需要看到
+		// "为什么非健康"。有生效冷却时以冷却 reason 为准（冷却通常语义更具体）。
+		if st.Reason == "" && now.Before(e.degradeUntil) {
+			st.Reason = degradeReason
+			st.CoolKind = "degrade"
+		}
 	}
 	return st
 }
@@ -485,6 +518,39 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	}
 	if len(rows) == 0 {
 		return nil
+	}
+	return rows
+}
+
+// modelCostsStatusLocked 构建单账号的成本台账行，从 modelCost 遍历输出——
+// 每模型一行（单价/最近观测/样本数），仅 modelCostTTL 内的有效观测，过期即
+// 消失（与 modelCostOf 读取口径一致；与 rateLimitedModelsLocked 同构）。
+// 先排序模型名保证 /status 输出稳定（map 遍历无序）。无观测 → nil（零回归）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus {
+	if len(e.modelCost) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(e.modelCost))
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			continue // 过期/零值：不进台账（与选号读取侧同口径）
+		}
+		models = append(models, m)
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	sort.Strings(models)
+	rows := make([]ModelCostStatus, 0, len(models))
+	for _, m := range models {
+		mc := e.modelCost[m]
+		rows = append(rows, ModelCostStatus{
+			Model:     m,
+			CostPer1k: mc.CostPer1k,
+			LastSeen:  mc.LastSeen,
+			Samples:   mc.Samples,
+		})
 	}
 	return rows
 }

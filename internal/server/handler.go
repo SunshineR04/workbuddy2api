@@ -81,6 +81,9 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
+	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
+	wafIP wafIPGate
 }
 
 // NewHandler 构建 handler。
@@ -198,6 +201,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	// cost_explore 探索台账（issue #136 §5 可观测性）：累计探索事件数 + 各
+	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
+	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
+	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -213,6 +220,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
+		"cost_explore": map[string]any{
+			"events_total": exploreEvents,
+			"per_model":    exploreLast,
+		},
 	})
 }
 
@@ -331,12 +343,17 @@ func (h *Handler) modelList() []map[string]any {
 			"id":                "cn:" + mi.ID,
 			"object":            "model",
 			"created":           1753600000,
-			"owned_by":          "workbuddy",
-			"context_length":    mi.ContextWindow,
-			"max_output_tokens": mi.MaxTokens,
+			"owned_by": "workbuddy",
 		}
-		if mi.ContextWindow == 0 {
-			entry["context_length"] = 131072 // 兜底
+		// context_length / max_output_tokens 四级查找（upstream.context_catalog +
+		// model_catalog）：上游动态值（maxInputTokens/maxOutputTokens）权威 → 静态
+		// 种子表 → model.json 本地缓存 → models.dev 按需拉取（异步不阻塞本次响应，
+		// 拉到后写 model.json 供下次命中）→ 1M 兜底 / max_output_tokens 省略。
+		// 上游零值不再透出假 131072（误导 Codex/ZCode 等按 context_length 提前
+		// 截断、白白丢上下文）。
+		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, h.cfg.Upstream.HTTP)
+		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, h.cfg.Upstream.HTTP); ok {
+			entry["max_output_tokens"] = mo
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
 		entry = applyModelInfoFields(entry, mi)
@@ -367,22 +384,23 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
-				"id":             "global:" + id,
-				"object":         "model",
-				"created":        1753600000,
-				"owned_by":       "workbuddy",
-				"context_length": 131072,
+				"id":       "global:" + id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
 			}
+			// context_length / max_output_tokens 四级查找（upstream.model_catalog，
+			// 与 CN 动态分支同口径）：探测富条目真实值权威 → 静态种子表 →
+			// model.json 缓存 → models.dev 按需拉取（异步）→ 1M 兜底/省略。
+			// 裸 ID 条目（窄表探测）也经种子表补齐，不再裸 131072。
+			var remoteCtx, remoteOut int64
 			if mi, ok := globalInfos[id]; ok {
 				entry = applyModelInfoFields(entry, mi)
-				// 富条目命中：context_length/max_output_tokens 用探测真实值替换
-				// 131072 兜底（与 CN 动态分支同口径；上游零值保留兜底）。
-				if mi.ContextWindow > 0 {
-					entry["context_length"] = mi.ContextWindow
-				}
-				if mi.MaxTokens > 0 {
-					entry["max_output_tokens"] = mi.MaxTokens
-				}
+				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
+			}
+			entry["context_length"] = upstream.ContextWindowListingV4(id, remoteCtx, h.cfg.Upstream.HTTP)
+			if mo, ok := upstream.MaxOutputTokensListingV4(id, remoteOut, h.cfg.Upstream.HTTP); ok {
+				entry["max_output_tokens"] = mo
 			}
 			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
 				entry["reasoning_supported_efforts"] = efforts
@@ -547,6 +565,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		turnKey = session.TurnKey(body)
 	}
 
+	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
+	// 同理）。11133「模型不支持图片」指向的前提。
+	reqHasImage := hasImagePart(body)
+
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
 	defer func() {
@@ -578,12 +600,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
+	//   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动
+	//     （客户端项目规范/工具约定与网关提示词并用，issue #129）。
 	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
-	//   - passthrough 非降级期：透传客户端原始 system（不改写）。
+	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
+	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
+	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "passthrough" && h.degrade.Active() {
+	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+		body = prompt.Append(body, h.cfg.PromptText)
+	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
@@ -638,6 +666,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
+		st.nick = acct.Nickname
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -676,7 +706,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
+				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
 			}
 		}
 
@@ -699,9 +729,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if uerr == nil && terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
+			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
+			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
@@ -717,11 +750,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
-			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
+			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
+			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
+			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && h.cfg.PromptMode == "passthrough" && !degradedApplied {
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
@@ -742,7 +776,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 					msg = "content blocked by upstream content firewall"
 				}
-				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
+					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
+			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
+			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
+			// 与 WAF IP fail-fast 同哲学：确定与账号无关的错误直接终止轮转）。
+			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError，
+			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
+			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
+			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
+			if kind == upstream.ErrPromptTooLong {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
+					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				return
 			}
@@ -751,6 +801,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
+			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
+			// 任务书设计纪律）：该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，
+			// IP 被拦而非账号）则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍
+			// 打同一出口 IP，加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账
+			// （单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
+			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+				break
+			}
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
 			}
@@ -769,18 +827,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
+			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
+			// 组装请求上下文做判定）。
+			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+				return h.hintContext(bareModel, reqHasImage)
+			}))
+			if upstream.IsEmptyStreamError(sErr) {
+				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
+				// 兜底（HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/
+				// 状态收敛到 502 观测，与非流式 Aggregate 空流→502 upstream_parse
+				// 同语义（此前 `_ =` 吞错把失败流记成 200，运维看到假成功）。
+				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
+				// 502 观测没有意义）。
+				st.status = http.StatusBadGateway
+				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+			}
 			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
+			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
+			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
+			// 与非流式走 completionTokens 返回 -1 的口径不一致。
+			toks, hasUsage := stats.Tokens()
+			if hasUsage {
+				st.toks = toks
+			}
+			// 统计模块取末帧完整 usage 明细（无 usage 时为 nil，与上面的 -1 哨兵同口径）。
 			st.usage = stats.Usage()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
-			} else if _, hasUsage := stats.Tokens(); hasUsage {
+			} else if hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
-				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
+				log.Printf("WARN: [server] stream usage without credit acct=%s model=%s (no cost observation)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
 			rc.Close()
 			return
@@ -822,21 +902,43 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
+	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定（11133/11135
+	// 在 hint 层自带形态判定，ErrClient 家族也能带上 hint）；本地调度类错误
+	// （无上游原文）固定 no_healthy_account hint。
+	hint := upstream.NoHealthyAccountHint()
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
+		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
 		switch ue.Kind {
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrWafBlock:
+			if h.wafIP.active() {
+				// IP 级拦截措辞（fail-fast 终止路径）：空 body 时给出明确可读文案——
+				// 网关出口 IP 被 WAF 拦截、轮转已止损、窗口 X 秒后自动解除。客户端
+				// 提前重试无意义（换号不换 IP）；有上游原文时原文优先（下方统一）。
+				code = "waf_ip_blocked"
+				msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
+			}
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
 			msg = s
 		}
 	}
-	writeOpenAIError(w, status, code, msg)
+	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
+}
+
+// promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
+// 上限值/requestId，客户端自行排查）；空 body 兜底为可读分类短文案（不编造原文）。
+func promptTooLongMessage(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return "prompt is too long"
+	}
+	return body
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：
@@ -878,11 +980,18 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
 //     降级重试，最终仍拦则回 400 content_blocked（防火墙文案，不含账号/错误码）。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
+//   - ErrPromptTooLong → 11115「prompt is too long」：请求的问题不是账号的问题
+//     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
+//     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
+//     该分支只为文档完备，不指望走到换号路径。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
 //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
-//   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
+//   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
+//     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
+//     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（health
+//     或门；带权威分类的错误不喂连败，防重复计罚）。ErrNone 零防御路径不喂。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
 // 携带的模型名（触发 6004 时记录以便后续切模型豁免）。uerr 是 ChatStreamContext 返回的
@@ -960,6 +1069,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+	case upstream.ErrPromptTooLong:
+		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
+		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
+		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
+		// 不指望走到换号路径。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
@@ -973,6 +1087,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
+		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →
+		// 账号临时出池（NoteFailures 达阈降权），单次/偶发不罚（不误伤）。ErrNone
+		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
+		if kind == upstream.ErrClient {
+			h.cfg.Pool.NoteFailures(uid)
+		}
 	}
 }
 
@@ -995,4 +1115,92 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// writeOpenAIErrorHint 同 writeOpenAIError，另在 error 对象上附加
+// error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。
+// message 仍是上游原文透传（hint 只做并列补充，绝不替换/包装 message）。
+func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
+	if hint == "" {
+		writeOpenAIError(w, status, code, msg)
+		return
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message":      msg,
+			"type":         "api_error",
+			"code":         code,
+			"gateway_hint": hint,
+		},
+	})
+}
+
+// hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
+// messages[].content[] {type:"image_url"}）。畸形/其他形态一律 false（hint 侧
+// 宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
+func hasImagePart(body []byte) bool {
+	var peek struct {
+		Messages []struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &peek) != nil {
+		return false
+	}
+	for _, m := range peek.Messages {
+		for _, p := range m.Content {
+			if p.Type == "image_url" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hintContext 组装 chatCompletions 的 gateway_hint 判定上下文：请求裸模型名 +
+// 是否带图 + 模型目录 supports_images 声明（目录未收录 → ModelInCatalog=false，
+// 不做「不支持」判定，防查不到误判）。仅错误路径调用（成功请求零开销）。
+//
+// 目录查询只读既有缓存快照（cachedModelsSnapshot），**不触发上游拉取**：错误路径
+// 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
+// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 1h 未
+// 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
+func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
+	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
+	if bareModel == "" {
+		return ctx
+	}
+	for _, mi := range cachedModelsSnapshot() {
+		if mi.ID == bareModel {
+			ctx.ModelInCatalog = true
+			ctx.ModelSupportsImages = mi.SupportsImages
+			return ctx
+		}
+	}
+	return ctx
+}
+
+// cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。
+// 不发起任何上游调用（与 fetchDynamicModels 的差异点，见 hintContext 注释）。
+func cachedModelsSnapshot() []upstream.ModelInfo {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
+		return nil
+	}
+	return dynamicModelsCache.ids
+}
+
+// hintOf 末端错误透传的统一 hint 入口：kind + 上游原文 + 请求上下文 →
+// gateway_hint 文案（upstream.GatewayHint 单一事实来源）。uerr 为 nil 时回落
+// body 原文判定（防御路径）。transport 层错误（lastErr 非 *upstream.Error 且
+// 上游没回 body）→ 无 hint（不编造）。
+func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage bool, uerr *upstream.Error) string {
+	msg := body
+	if uerr != nil && uerr.Msg != "" {
+		msg = uerr.Msg
+	}
+	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
 }

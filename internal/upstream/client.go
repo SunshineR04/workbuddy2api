@@ -35,6 +35,7 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -60,6 +61,8 @@ func (k ErrKind) String() string {
 		return "model_blocked"
 	case ErrWafBlock:
 		return "waf_block"
+	case ErrPromptTooLong:
+		return "prompt_too_long"
 	case ErrClient:
 		return "client"
 	default:
@@ -110,16 +113,6 @@ func (r errorRule) hit(body, lower string) bool {
 		}
 	}
 	return false
-}
-
-// firstHit 返回第一条命中的 marker 原文（供「哪个词命中」的场景）；无命中返回 ""。
-func (r errorRule) firstHit(body, lower string) string {
-	for _, p := range r.patterns {
-		if matchPattern(p, r.mode, body, lower) {
-			return p
-		}
-	}
-	return ""
 }
 
 // Error 带分类的上游错误。
@@ -212,6 +205,30 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 	"trial not activated",
 	"trial version is not yet activated",
 }}
+
+// promptTooLongRule 11115「prompt is too long」判定（任务书 prompt-too-long §1）。
+// 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
+// 超限，与 WAF fail-fast 同哲学（确定与账号无关的错误不罚号不轮转，白白浪费健康号
+// 的请求配额）。marker 双通道：
+//   - `"code":11115`：业务信封 code 字段（JSON 空格容差，与 11102/6004 的 code 判定
+//     同形态；`"code":"11115"` 字符串形态也命中）；
+//   - "prompt is too long"：msg 文案（大小写不敏感）。
+//
+// 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
+// 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
+//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// 上游原文可自行排查，代价可控。
+var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
+	`"code":11115`,
+	`"code":"11115"`,
+	"prompt is too long",
+}}
+
+// isPromptTooLongStatus 11115 只在请求级 4xx 上判（见 promptTooLongRule 注释）。
+func isPromptTooLongStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound ||
+		status == http.StatusRequestEntityTooLarge
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -427,37 +444,47 @@ func ParseRateReset(body string) (time.Time, bool) {
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （详见 IsModelBlocked 注释）。
-//  1. 402 / hardRule —— 计费额度耗尽，最严、最不可自愈，必须最先判。
-//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
-//     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
+//     （详见 IsModelBlocked 注释；只认 400/404，429+11102 属限流语义走第 3 层）。
+//  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. sessionDeadRule —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
 //  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
-//     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
-//     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
+//     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
+//     soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
-//     落到 softRateRule 层，不受影响。
-//  4. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
-//     结果同为 soft_rate，与下一层一致。
-//  5. status==429 —— body 无文案时的兜底识别。
-//  6. 404 / 5xx —— 与限流无关的常规分类。
-//  7. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//     不在此层命中，后续走 softRateRule 层，不受影响。
+//  4. status==429 —— 限流状态码兜底（本层先于 hardRule，fork-scan-absorb T-3）：
+//     429 body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+//     若 hardRule 先判会把限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约
+//     12h。状态码是比关键词更权威的信号：上游既然给了 429，就按限流语义处理
+//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardRule（第 5 层）。
+//  5. hardRule —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit；429 场景已由
+//     第 4 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
+//     原始响应确认后再定）。
+//  6. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 4 层
+//     短路，结果同为 soft_rate。
+//  7. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
+//  8. 404 / 5xx —— 与限流无关的常规分类。
+//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态（WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落
 //     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
-//     带业务信封的 403 已被上方 1-5 层捕获（11140 request illegal →
+//     带业务信封的 403 已被上方各层捕获（11140 request illegal →
 //     ErrAccountFault 禁用语义不变），走不到本层。
-//  8. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  10. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
 	// 但可能被更宽的 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
 	// 先于 hardRule：11102 答复的 msg 是模型不存在，不含 credit/quota/积分 等计费词，
 	// 正常不会撞 hardRule，但前置判定让语义零歧义（防上游未来在 msg 里混入余额词）。
+	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
 	if IsModelBlocked(status, body) {
 		return ErrModelBlocked
 	}
@@ -465,20 +492,35 @@ func Classify(status int, body string) ErrKind {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	if hardRule.hit(body, lower) {
-		return ErrHardCredit
-	}
+	// sessionDead / accountFault 先于 status==429（原顺序已如此，此处只是跟随
+	// 429 前移保持相对次序）：账号级终态等不来自愈，限流状态码不得掩盖它们
+	// （429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须 sessionDead）。
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
 	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
 	}
+	// status==429 先于 hardRule（fork-scan-absorb T-3，本次修复点）：限流响应 body
+	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardRule 先判会误归
+	// ErrHardCredit 硬冷却到次日 04:00。402 真余额在上层已判；非 429 的 quota
+	// 措辞仍走下方 hardRule，历史语义不变。
+	if status == http.StatusTooManyRequests {
+		return ErrSoftRate
+	}
+	if hardRule.hit(body, lower) {
+		return ErrHardCredit
+	}
 	if softRateRule.hit(body, lower) {
 		return ErrSoftRate
 	}
-	if status == http.StatusTooManyRequests {
-		return ErrSoftRate
+	// 11115「prompt is too long」（任务书 prompt-too-long §1）：判在 404/5xx/
+	// WAF/内容策略/参数错误/通用 4xx 之前——请求级语义最具体（上下文超限），须
+	// 先于宽泛的状态码兜底（404 兜底会误归 ErrNotFound 只冷却不透传；ErrClient
+	// 只换号，浪费健康号配额）。只认请求级 4xx 状态码（见 promptTooLongRule），
+	// 429/5xx 在上方已被各自状态码层短路（限流/服务端故障语义优先）。
+	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
+		return ErrPromptTooLong
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
@@ -606,15 +648,10 @@ type Client struct {
 	GlobalEnabled bool
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
+// New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：禁 h2 /
+// TLS 握手超时 / 短 keepalive 探测，参数见 transport.go）。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	tr := newTransport()
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -823,6 +860,11 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 // 单账号 hang 对该账号相关操作的阻塞越短（issue:持锁 120s I/O → 池级停滞）。
 const refreshIOTimeout = 30 * time.Second
 
+// refreshTokenExpiresInMax refresh 响应 expiresIn 的量级上限（10 年，纯防御值：
+// 实测 R-D 响应恒 5184000=60d）。超限视为上游脏数据，不写 ExpiresAt（保留旧值），
+// 防止 NeedsRefresh 永假导致 token 永不刷新反而真过期失效。
+const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
+
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
@@ -883,10 +925,15 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 第 2 段（锁内）：校验快照一致后写回。
 	a.Lock()
 	defer a.Unlock()
+	// 写回守卫是 AND 语义：锁外期间另一刷新已完成 → 两 token 必同时变化（实测 R-D：
+	// refresh 响应 accessToken/refreshToken 总是一起 rotate，写回也同时写两个），AND
+	// 即「并发刷新已完成」判据；AND 与 OR 在真实形态下等价。唯 OR 会额外放弃的
+	// 「只有单 token 变化」（如手工只改 auth 文件一个字段）不构成放弃条件——本次
+	// 结果覆盖手工编辑。
 	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
 		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
-		// （两个并发刷新拿到的新 token 都有效，后写会覆盖先写，但二者等价可用；
-		// 提前返回避免无意义覆盖与 ExpiresAt 抖动）。
+		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
+		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
 		return nil
 	}
 	a.AccessToken = tok.AccessToken
@@ -897,20 +944,15 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		a.Domain = tok.Domain
 	}
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	if tok.ExpiresIn > 0 {
+	// 实测 R-D 响应恒带 expiresIn=5184000（60d）——缺省分支仅为防御，保留旧值
+	// 避免过期判定漂移。同理，超过 10 年的 expiresIn 按脏值处理保留旧值：
+	// 实测 JWT exp-iat 与 expiresIn 严格自洽（R-F），超量级值只会是上游脏数据，
+	// 照写会把 ExpiresAt 推到荒谬未来 → NeedsRefresh 永假 → token 永不刷新
+	// 反而真过期失效。
+	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil
-}
-
-// chatPath 按 realm 返回 chat 端点路径（不含 base）：
-// global → /console/chat/completions（404/405 时由 ChatStream fallback /v2/chat/completions）；
-// cn → /v2/chat/completions（现状逐字，零回归）。
-func (c *Client) chatPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalChatConsolePath
-	}
-	return chatCompletionsPath
 }
 
 // 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
@@ -972,7 +1014,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
+			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固第 5 件）：
+			// 失败连接可能仍留在空闲池里，下一个请求会继续捡到它（kongjianguan
+			// 实测：仅靠 IdleConnTimeout 等过期不够，主动清池才断根）。
+			roundTripCloseIdle(c.chatHTTP().Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -982,12 +1028,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
 			if rerr != nil {
-				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+				log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v", logfmt.Label(a.UID, a.Nickname), rerr)
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
 			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
+				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
 			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 				continue
@@ -1245,7 +1291,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1325,7 +1371,7 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
 	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
 	c.CommonHeaders(req, a)
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1384,7 +1430,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 }
 
 // CreditBuckets 按到期紧迫度拆分的积分余额（供 pool 优先消耗快过期积分）。
-// 背景（issue:积分过期）：套餐/奖励积分按 PackageEndTime 分批过期，总量口径的
+// 背景（issue:积分过期）：套餐/奖励积分按 CycleEndTime 分批过期，总量口径的
 // remain 会让"明天就作废"的积分与"30 天后才过期"的积分被无差别选号，
 // 导致快过期积分没优先用掉、白白作废。拆桶后选号可优先消耗 Expiring。
 type CreditBuckets struct {
@@ -1397,64 +1443,41 @@ type CreditBuckets struct {
 // Total 返回两桶合计可用积分（= UserResource 的 remain 口径）。
 func (b CreditBuckets) Total() int64 { return b.Expiring + b.Stable }
 
-// packageEndLayout 上游 PackageEndTime 的时间格式（与请求体过滤串同口径）。
+// packageEndLayout 上游 CycleEndTime / 请求体过滤串的时间格式（墙钟）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
 // UserResourceDetailed 同 UserResource，但按到期时间把余额拆成 CreditBuckets。
 // soon>0 时把到期时间 <= now+soon 的套餐余额计入 Expiring；soon<=0 时全部归 Stable。
-// PackageEndTime 解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
-// 单套餐取数口径（Cycle* 优先）与 UserResource 完全一致，保证向后兼容。
+// 到期时间判据是 CycleEndTime（R-A/R-B 实测：CN/global 两域字段全集均无 PackageEndTime，
+// 旧判据恒 miss 致 Expiring 恒 0；CycleEndTime 是上游真实下发的到期时刻——
+// global Bonus Pack 14 天赠送积分的到期时间即此字段）。解析失败/缺失的套餐保守
+// 归入 Stable（不误标为快过期而插队）。
+// 单套餐取数统一调 packageRemainUsed（与 ResourceSummary/cmd/credit 同一事实来源，
+// 含 remain 钳 [0,size] 与 used 修正；A/B 口径在 remain 维度实测一致，此改动消除
+// 双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据 CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
 	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
-	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	resp, err := c.getUserResourceBody(a)
 	if err != nil {
 		return 0, CreditBuckets{}, err
 	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					PackageEndTime      string `json:"PackageEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, CreditBuckets{}, fmt.Errorf("resource parse: %w", err)
-	}
 	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
-		switch {
-		case acct.CycleCapacitySize > 0:
-			r = acct.CycleCapacityRemain
-		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r = acct.CycleCapacityRemain
-		default:
-			r = acct.CapacityRemain
-		}
+		r, _, _ := packageRemainUsed(respAccount{
+			CapacityRemain:      acct.CapacityRemain,
+			CapacityUsed:        acct.CapacityUsed,
+			CapacitySize:        acct.CapacitySize,
+			CycleCapacityRemain: acct.CycleCapacityRemain,
+			CycleCapacityUsed:   acct.CycleCapacityUsed,
+			CycleCapacitySize:   acct.CycleCapacitySize,
+		})
 		if r < 0 {
 			r = 0
 		}
 		remain += r
 		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → Expiring。
-		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
+		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
 			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
+			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
 				if !end.After(now.Add(soon)) {
 					buckets.Expiring += r
 					continue
@@ -1466,45 +1489,61 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 	return remain, buckets, nil
 }
 
-// ResourceSummary 查询账号积分套餐的完整聚合口径（remain=剩余可花积分、used=已用、
-// size=总量、packs=套餐数），供运维工具（cmd/credit）按 realm 展示真实余额。
-// 与 UserResource 的差异：UserResource 只取 remain；本方法额外聚合 used/size/packs，
-// 且 TotalDosage 作 size 下限（与 cmd/credit 历史口径一致，见其 packageRemainUsed）。
-//
-// realm 感知继承 billingMeterPaths：global 账号打 workbuddy.ai /billing/meter/*（404
-// fallback /v2），CN 账号维持 /v2/billing/meter/get-user-resource（现状逐字，零回归）。
-func (c *Client) ResourceSummary(a *auth.Auth) (remain, used, size int64, packs int, err error) {
+// userResourceResp get-user-resource 响应结构（UserResourceDetailed 与 ResourceSummary
+// 共享；含分桶所需 CycleEndTime 与聚合所需 TotalDosage，缺省字段按零值处理）。
+type userResourceResp struct {
+	Response struct {
+		Data struct {
+			TotalDosage int64 `json:"TotalDosage"`
+			Accounts    []struct {
+				PackageName         string `json:"PackageName"`
+				CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+				CapacitySize        int64  `json:"CapacitySize"`
+				CapacityRemain      int64  `json:"CapacityRemain"`
+				CapacityUsed        int64  `json:"CapacityUsed"`
+				CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+				CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+				CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+			} `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+// getUserResourceBody 发 get-user-resource 请求并解析响应（两消费方共享：请求体构造
+// 与解析逻辑原本 100% 重复）。realm 感知继承 billingMeterPaths：global 账号打
+// workbuddy.ai /billing/meter/*（404 fallback /v2），CN 账号维持
+// /v2/billing/meter/get-user-resource（现状逐字，零回归）。
+func (c *Client) getUserResourceBody(a *auth.Auth) (*userResourceResp, error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
 		"ProductCode":              "p_tcaca",
 		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
+		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return nil, err
 	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				TotalDosage int64 `json:"TotalDosage"`
-				Accounts    []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
+	var resp userResourceResp
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return nil, fmt.Errorf("resource parse: %w", err)
+	}
+	return &resp, nil
+}
+
+// ResourceSummary 查询账号积分套餐的完整聚合口径（remain=剩余可花积分、used=已用、
+// size=总量、packs=套餐数），供运维工具（cmd/credit）按 realm 展示真实余额。
+// 与 UserResource 的差异：UserResource 只取 remain；本方法额外聚合 used/size/packs，
+// 且 TotalDosage 作 size 下限（与 cmd/credit 历史口径一致，见其 packageRemainUsed）。
+//
+// realm 感知继承 getUserResourceBody（billingMeterPaths）。
+func (c *Client) ResourceSummary(a *auth.Auth) (remain, used, size int64, packs int, err error) {
+	resp, err := c.getUserResourceBody(a)
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		r, u, s := packageRemainUsed(respAccount{

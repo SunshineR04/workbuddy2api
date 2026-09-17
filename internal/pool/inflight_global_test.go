@@ -56,6 +56,31 @@ func TestInFlightGlobalTierUnsetFallsBack(t *testing.T) {
 	}
 }
 
+// TestAcquireUnknownUIDNoPanic 未知 uid 的 Acquire 安全返回 false：Acquire 在
+// !ok 判空前曾先调 inFlightLimit（快照注释语义），maxInFlightGlobal>0 时对
+// nil entry 解引用 e.a.Realm() 直接 panic——会话粘性路由对刚被 Remove 的账号
+// （如 token 失效禁用）仍持 uid 调 Acquire 时即触发。
+func TestAcquireUnknownUIDNoPanic(t *testing.T) {
+	withNoPickGap(t)
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	p := New("")
+	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at"})
+	p.SetMaxInFlight(3)
+	p.SetMaxInFlightGlobal(2)
+
+	// 已入池账号正常放行（对照组，排除「号没进去」的误判）。
+	if !p.Acquire("g1") {
+		t.Fatal("known uid acquire should succeed")
+	}
+	p.Release("g1")
+	// 未知 uid：不 panic，返回 false（global 分档启用 + uid 不在池内的组合）。
+	if p.Acquire("no-such-uid") {
+		t.Fatal("unknown uid acquire should return false")
+	}
+}
+
 // TestPickSkipsGlobalTierFull 选号侧分档：global 号占满 2 档后 Pick 跳过
 // （inFlightFull 走同一路径），不被 cn 档的 3 误放行。
 func TestPickSkipsGlobalTierFull(t *testing.T) {

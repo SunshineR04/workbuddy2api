@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/metrics"
 )
 
@@ -27,6 +28,7 @@ type chatStat struct {
 	model  string
 	mode   string // "stream" | "sync"
 	uid    string // 完整 uid，展示时只取前 8 位
+	nick   string // 账号昵称（auth.Auth.Nickname，登录时落盘）；空则只显示 uid8
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -55,7 +57,7 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	s.record()
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks)
 }
 
 // record 把本次请求写入统计收集器（collector 为 nil 时无操作）。
@@ -300,50 +302,66 @@ func float64Field(m map[string]any, key string) float64 {
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
+//
+// 保留本函数是因为 logging_test.go 直接断言它；实现委托 logfmt.UID8，避免
+// "截 8 位" 的规则在 server 与 logfmt 两处各写一份而走样。
 func uidPrefix(uid string) string {
-	if uid == "" {
-		return "-"
-	}
-	if len(uid) > 8 {
-		return uid[:8]
-	}
-	return uid
+	return logfmt.UID8(uid)
 }
 
+// 请求流水行的固定列宽（显示列宽，非字节）。取固定宽度而不是让内容自然长度撑开，
+// 是为了让 stdout 里成百上千行能竖着扫——否则模型名长短不一、中文昵称按字节补空格
+// 错位，根本没法用肉眼对齐着一列列看（这正是上一版 11 字节硬截断要解决的问题）。
+const (
+	// chatModelWidth 覆盖 realm 前缀 + 最长模型名："global:" (7) + "deepseek-v4.1-flash" (19) = 26。
+	// 旧的 11 字节截断会把 "cn:deepseek-v4-flash" 切成 "cn:deepseek"，让人误以为是另一个模型。
+	chatModelWidth = 26
+	// chatAcctWidth 容纳 "昵称(uid8)"：中文昵称按 2 列/字算，5 字中文 + "(xxxxxxxx)" = 20 列。
+	chatAcctWidth = 22
+	chatTTFBWidth = 8
+	chatTokWidth  = 6
+	chatRateWidth = 11 // 形如 "183.6tok/s"
+)
+
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+//
+// 参数：
+//   - model：模型名（含 realm 前缀），超 chatModelWidth 截断（模型名是 ASCII，字节截即列宽）；
+//   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
+//     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
+//   - toks<0 表示 usage 缺失，显示 "-"。
+func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
+	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
+	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
+	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
 		if total > 0 {
-			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
+			tokpsField = fmt.Sprintf("%.1ftok/s", float64(toks)/total.Seconds())
 		} else {
-			tokpsField = "0.0"
+			tokpsField = "0.0tok/s"
 		}
 	}
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
-		uidPrefix(uid),
-		ttfbMS,
-		tokField,
-		tokpsField,
+		acct,
+		logfmt.Pad(ttfbMS, chatTTFBWidth),
+		logfmt.Pad(tokField, chatTokWidth),
+		logfmt.Pad(tokpsField, chatRateWidth),
 		total.Seconds(),
 	)
 }

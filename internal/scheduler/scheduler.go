@@ -290,7 +290,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
 			skipN++
 			out = append(out, oc)
@@ -308,11 +308,11 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("checkin %s refresh: %v", logfmt.UID8(st.UID), err)
+				log.Printf("checkin %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
-						log.Printf("WARN: checkin %s: 连续 %d 次 12153 session dead — 禁用", logfmt.UID8(st.UID), pool.SessionDeadThreshold())
+						log.Printf("WARN: checkin %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 					}
 				}
 				// 刷新只是"提前补票"：token 若仍有效，继续照常签到（否则刷新接口抖动
@@ -327,7 +327,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := a.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-					log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+					log.Printf("checkin %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 				}
 			}
 		}
@@ -340,7 +340,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			} else {
 				oc.Status = CheckinFail
 				oc.Detail = err.Error()
-				log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 		} else {
 			oc.Status = CheckinOK
@@ -349,7 +349,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			oc.Status = CheckinFail
 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
 			failN++
@@ -414,7 +414,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -432,10 +432,10 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		for i := 1; i <= count; i++ {
 			rid := fmt.Sprintf("%s-r%d", cid, i)
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
-				log.Printf("activity %s: report %d/%d: %v", logfmt.UID8(a.UID), i, count, err)
+				log.Printf("activity %s: report %d/%d: %v", logfmt.Label(a.UID, a.Nickname), i, count, err)
 				break // 本号上报失败：不再续发，streak 自检无意义
 			}
-			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
+			log.Printf("activity %s: report %d/%d ok", logfmt.Label(a.UID, a.Nickname), i, count)
 			ok++
 			if i < count {
 				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
@@ -463,14 +463,14 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.UID8(a.UID), err)
+		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.Nickname), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("WARN: activity %s: report OK but streak.days=0 (silent drop?)", logfmt.UID8(a.UID))
+		log.Printf("WARN: activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.Nickname))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", logfmt.UID8(a.UID), days)
+	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.Nickname), days)
 	return false
 }
 
@@ -493,7 +493,7 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 //
 // 日志每号一行可 grep：`activity %s: redeem tier=%s ...` / `activity %s: lottery ...`。
 func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
-	if a == nil || a.AccessToken == "" {
+	if a == nil || a.AccessTokenValue() == "" {
 		return
 	}
 	// global 门控：连登奖励/抽奖链只服务 CN。国际版 /activity/growth/* 端点虽同构存在
@@ -512,7 +512,7 @@ func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
 	s.claimGrowthBonus(a)
 	state, err := s.cfg.Upstream.GrowthRewardState(a)
 	if err != nil {
-		log.Printf("WARN: activity %s: reward-state: %v", logfmt.UID8(a.UID), err)
+		log.Printf("WARN: activity %s: reward-state: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	// 0.5 补签保连登（panel makeupYesterday 口径）：昨日漏签（heatmap score==0）且
@@ -533,11 +533,11 @@ func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
 	switch {
 	case err == nil:
 		log.Printf("activity %s: redeem tier=%s ok (+%d credit, +%d energy, +%d chances)",
-			logfmt.UID8(a.UID), tier, res.CreditGranted, res.EnergyGranted, res.ChancesGranted)
+			logfmt.Label(a.UID, a.Nickname), tier, res.CreditGranted, res.EnergyGranted, res.ChancesGranted)
 	case upstream.IsRedeemAlreadyClaimed(err) || upstream.IsRedeemNotEnoughDays(err):
-		log.Printf("activity %s: redeem tier=%s skip (already claimed or days not enough)", logfmt.UID8(a.UID), tier)
+		log.Printf("activity %s: redeem tier=%s skip (already claimed or days not enough)", logfmt.Label(a.UID, a.Nickname), tier)
 	default:
-		log.Printf("activity %s: redeem tier=%s: %v", logfmt.UID8(a.UID), tier, err)
+		log.Printf("activity %s: redeem tier=%s: %v", logfmt.Label(a.UID, a.Nickname), tier, err)
 	}
 	// 标记当日已处理（无论 redeem 是否成功都记一次：领取类各状态当日不再重试，
 	// 避免对上游重复写；成功→无需再领，失败→当日不轰炸，次日自然日重置/上游幂等兜底）。
@@ -567,10 +567,10 @@ func growthEligibleTier(days int, rs *upstream.GrowthRedemptionStatus) string {
 // 业务错误是常态（绝大多数号早已领过），无法与真错误可靠区分，不刷 WARN。
 func (s *Scheduler) claimGrowthBonus(a *auth.Auth) {
 	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil && credit > 0 {
-		log.Printf("activity %s: gift ok (+%d credit)", logfmt.UID8(a.UID), credit)
+		log.Printf("activity %s: gift ok (+%d credit)", logfmt.Label(a.UID, a.Nickname), credit)
 	}
 	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil && credit > 0 {
-		log.Printf("activity %s: compensation ok (+%d credit)", logfmt.UID8(a.UID), credit)
+		log.Printf("activity %s: compensation ok (+%d credit)", logfmt.Label(a.UID, a.Nickname), credit)
 	}
 }
 
@@ -596,10 +596,10 @@ func (s *Scheduler) makeupYesterday(a *auth.Auth) bool {
 		return false // 无卡或查询失败：静默（次日再判）
 	}
 	if err := s.cfg.Upstream.UseMakeupCard(a, yesterday); err != nil {
-		log.Printf("activity %s: makeup %s: %v", logfmt.UID8(a.UID), yesterday, err)
+		log.Printf("activity %s: makeup %s: %v", logfmt.Label(a.UID, a.Nickname), yesterday, err)
 		return false
 	}
-	log.Printf("activity %s: makeup ok %s (+streak kept)", logfmt.UID8(a.UID), yesterday)
+	log.Printf("activity %s: makeup ok %s (+streak kept)", logfmt.Label(a.UID, a.Nickname), yesterday)
 	return true
 }
 
@@ -609,21 +609,21 @@ func (s *Scheduler) makeupYesterday(a *auth.Auth) bool {
 func (s *Scheduler) claimGrowthLottery(a *auth.Auth) {
 	chances, err := s.cfg.Upstream.GrowthLotteryChances(a)
 	if err != nil {
-		log.Printf("WARN: activity %s: lottery-chances: %v", logfmt.UID8(a.UID), err)
+		log.Printf("WARN: activity %s: lottery-chances: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	if chances <= 0 {
-		log.Printf("activity %s: lottery skip (no chances)", logfmt.UID8(a.UID))
+		log.Printf("activity %s: lottery skip (no chances)", logfmt.Label(a.UID, a.Nickname))
 		return
 	}
 	res, err := s.cfg.Upstream.GrowthLotteryDraw(a, "") // 每次自动新 client_token
 	switch {
 	case err == nil:
-		log.Printf("activity %s: lottery drawn prize=%s (%s)", logfmt.UID8(a.UID), res.PrizeName, res.PrizeType)
+		log.Printf("activity %s: lottery drawn prize=%s (%s)", logfmt.Label(a.UID, a.Nickname), res.PrizeName, res.PrizeType)
 	case upstream.IsLotteryNoChance(err) || upstream.IsLotteryDisabled(err):
-		log.Printf("activity %s: lottery skip (no chances or disabled)", logfmt.UID8(a.UID))
+		log.Printf("activity %s: lottery skip (no chances or disabled)", logfmt.Label(a.UID, a.Nickname))
 	default:
-		log.Printf("activity %s: lottery draw: %v", logfmt.UID8(a.UID), err)
+		log.Printf("activity %s: lottery draw: %v", logfmt.Label(a.UID, a.Nickname), err)
 	}
 }
 
@@ -651,15 +651,15 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.UID8(st.UID), pool.SessionDeadThreshold())
+					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}
 			continue
@@ -667,7 +667,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
+			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
 }

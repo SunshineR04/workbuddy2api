@@ -731,3 +731,64 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
 	}
 }
+
+// ---- prompt.mode=append（issue #129 三模式） ----
+
+// TestPromptAppendModeAccepted B1：append 新值合法，PromptText 非空（内置默认，
+// 与 custom 同加载路径）。
+func TestPromptAppendModeAccepted(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"append"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "append" {
+		t.Errorf("mode=%q want append", c.Prompt.Mode)
+	}
+	if c.PromptText == "" {
+		t.Error("append should load PromptText (built-in default)")
+	}
+}
+
+// TestPromptAppendFileOverride B2：append + file → PromptText 为文件内容。
+func TestPromptAppendFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "my.md")
+	want := "我的 append 模式人格"
+	os.WriteFile(pf, []byte(want), 0o600)
+	cf := filepath.Join(dir, "c.json")
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"append","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
+	c, err := Load(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptText != want {
+		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
+
+// TestPromptAppendFileMissingFailsFast B3：append + 不可读 file → 启动报错（同 custom）。
+func TestPromptAppendFileMissingFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"append","file":"/nonexistent/p.md"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for missing prompt file in append mode")
+	}
+}
+
+// TestPromptInvalidModeStillErrors B4：非法值报错文案含三值说明。
+func TestPromptInvalidModeStillErrors(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"replace"}}`), 0o600)
+	_, err := Load(fp)
+	if err == nil {
+		t.Fatal("want error for invalid prompt.mode")
+	}
+	if !strings.Contains(err.Error(), "custom / append / passthrough") {
+		t.Errorf("error should mention (custom / append / passthrough): %v", err)
+	}
+}

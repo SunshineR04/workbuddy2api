@@ -42,8 +42,15 @@ func (s *bonusStub) handler() http.Handler {
 				return
 			}
 			// 昨日一格 score=0（漏签）+ 今日一格 score=1。
-			yest := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-			today := time.Now().Format("2006-01-02")
+			// 日期标签必须与生产侧同口径（CST 自然日，见 cstShanghai /
+			// GrowthYesterdayDate）：上游 heatmap 的 date 是 CST 自然日，断言侧也用
+			// CST（GrowthYesterdayDate 与 time.Now().In(cstShanghai)）。若此处用进程
+			// 本地时区（容器恒 UTC），则在 UTC 16:00–24:00（= CST 次日 00:00–08:00）
+			// 窗口内标签整体错一天：stub 的"今日"变成被测代码眼中的"昨日"，断言必然
+			// 失败（每天固定 8 小时的时序性红灯，不是偶发抖动）。
+			cstNow := time.Now().In(cstShanghai)
+			yest := cstNow.AddDate(0, 0, -1).Format("2006-01-02")
+			today := cstNow.Format("2006-01-02")
 			fmt.Fprintf(w, `{"code":0,"data":{"cells":[{"date":"%sT00:00:00+08:00","score":0},{"date":"%s","score":1}]}}`, yest, today)
 		case "/activity/growth/streak":
 			// makeup_cards 段（补签卡余额 2）。
@@ -202,5 +209,27 @@ func TestGrowthYesterdayDateCST(t *testing.T) {
 	now := time.Date(2026, 9, 16, 1, 0, 0, 0, cstShanghai)
 	if got := GrowthYesterdayDate(now); got != "2026-09-15" {
 		t.Errorf("GrowthYesterdayDate=%q want 2026-09-15", got)
+	}
+}
+
+// TestGrowthYesterdayDateDSTZone 容器时区含夏令时（如 America/New_York）时，
+// 昨日 CST 自然日必须仍按 CST 日界计算。
+//
+// 缺陷：GrowthYesterdayDate 先 AddDate(0,0,-1)（按**入参 Time 的时区**做日历日减法）
+// 再转 CST，而注释声称与 scheduler.travelDay 同口径（travelDay 是「先转 CST 再取日」）。
+// 在夏令时切换日，AddDate 保持墙钟时刻跨 23h/25h 的一天会把瞬时点挪 1 小时，
+// CST 日期随之错位一天——补签（makeupYesterday）会漏掉真实断档或补错日期。
+//
+// 春令时切换日（ET 2026-03-08）：01:00 CST 落在这个 ±1h 带内。
+// 修复前 buggy=2026-03-08（把「已过去的那天」算成今天）→ RED。
+func TestGrowthYesterdayDateDSTZone(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata 不可用: %v", err)
+	}
+	// 2026-03-08T15:30:00Z = ET 10:30（切换后）= CST 当日 23:30。
+	now := time.Date(2026, 3, 8, 15, 30, 0, 0, time.UTC).In(loc)
+	if got := GrowthYesterdayDate(now); got != "2026-03-07" {
+		t.Errorf("GrowthYesterdayDate=%q want 2026-03-07（昨日 CST；DST 切换日不得错位）", got)
 	}
 }

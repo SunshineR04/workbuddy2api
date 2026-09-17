@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -20,6 +21,16 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// modelJSONPath 由 state.json 路径推导 model.json 路径（同目录同名换缀）：
+// 两者同为数据目录持久化物（Docker ./data volume），配套而非各自配置。
+// state 路径为空（纯内存测试形态）→ 空 = 禁用 model.json 落盘（内存 + 种子仍可用）。
+func modelJSONPath(stateFile string) string {
+	if stateFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateFile), "model.json")
+}
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -47,6 +58,11 @@ func main() {
 	// Realm()/IsGlobal() 先过此闸——显式 false 时恒 cn（逃生门：纯 CN 锁定的第一道闸）。
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 
+	// model.json 本地缓存接线（context_length 四级查找链第 3 级）：数据目录与
+	// state.json 同风格（Docker volume 持久化路径 ./data）。首次缺失/损坏自动回落
+	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
+	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
+
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 
@@ -58,10 +74,13 @@ func main() {
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
+	// 连败降权（issue #114）：ErrClient/传输层连败 N 次临时出池。
+	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
-	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router

@@ -108,8 +108,13 @@ var cstShanghai = time.FixedZone("CST", 8*60*60)
 
 // GrowthYesterdayDate 昨日的 CST 自然日（2006-01-02）。补签判据固定盯昨日：
 // 连登断档只可能发生在「上一个自然日」（今日尚未结算）。
+//
+// 必须先 In(cstShanghai) 再 AddDate：AddDate 按**入参 Time 所在时区**做日历日减法，
+// 容器时区含夏令时时，切换日的 23h/25h 会把瞬时点挪 1 小时、CST 日期错位一天
+// （补签漏掉真实断档或补错日期）。先归一到 CST 再减日即与 scheduler.travelDay 同口径
+// （CST 无夏令时，减一日恒为前一个 CST 自然日）。
 func GrowthYesterdayDate(now time.Time) string {
-	return now.AddDate(0, 0, -1).In(cstShanghai).Format("2006-01-02")
+	return now.In(cstShanghai).AddDate(0, 0, -1).Format("2006-01-02")
 }
 
 // ClaimGift 领取新手礼包（POST /billing/meter/claim-gift，每号一次）。

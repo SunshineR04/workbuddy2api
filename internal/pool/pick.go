@@ -39,9 +39,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
+	// 惰性清理过期的 6004 模型级冷却与成本台账（两者的 map 都不无限膨胀；
+	// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 	for _, e := range p.byUID {
 		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
 	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
@@ -66,8 +68,8 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm)
 	}
-	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
-	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
+	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
+	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
 	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
 	// 抽签权重共享同一基准，两个阶段权重可比（旧实现 pickWeighted 在 eligible 子集
 	// 上重取 max，全集最大 credits 号被 minPickGap 挤出后子集 max 偏小，剩余号的
@@ -102,9 +104,37 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		return 2, mc.CostPer1k
 	}
 	bestTier := 2
+	hasTier1 := false
+	explored := false // 本次 pick 是否切了探索层（事件日志在选中号确定后打）
 	for _, e := range cands {
 		if ti, _ := costTier(e); ti < bestTier {
 			bestTier = ti
+		}
+	}
+	// 条件探索（issue #136 方案 a′，语义契约七条见设计报告 §2.1）：tier 0 垄断层
+	// 存在（bestTier==0 且 reqModel 非空）且候选含 tier 1（冻结存在）且距上次
+	// 探索 ≥ 窗口（零值 timer=从未探索→首次满足即探）时，本次 pick 生效层切
+	// tier 1-only——探索=搭车改道，把一个既有真实用户请求改道给未知号（零新增
+	// 上游请求；IP 维度零增量，WAF 友好）。成功 → NoteModelCost 首观测 → 毕业
+	// （tier 0/2，下一轮 pick 立即生效）；失败 → 既有错误策略照常，无探测风暴。
+	// hasTier1 复用本循环上方 costTier 的预计算口径（每候选一次的契约不变）——
+	// 下方 ws 构建循环顺带置位，不在判定处再算一遍。timer 同锁写入：并发 pick
+	// 串行进入写锁，只有一个进入者能通过窗口判定（天然防重复探索）。
+	// key = realm + "\x1f" + reqModel：同模型名可跨域，探索节奏按 (域, 模型)
+	// 独立；realm==""（Pick 老语义）单独成键。
+	if p.costExploreInterval > 0 && bestTier == 0 && reqModel != "" {
+		for _, e := range cands {
+			if ti, _ := costTier(e); ti == 1 {
+				hasTier1 = true
+				break
+			}
+		}
+		key := realm + "\x1f" + reqModel
+		if hasTier1 && now.Sub(p.exploreLast[key]) >= p.costExploreInterval {
+			p.exploreLast[key] = now
+			p.costExploreEvents++
+			bestTier = 1
+			explored = true
 		}
 	}
 	ws := make([]weighted, 0, len(cands))
@@ -182,6 +212,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	} else {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集，权重直接用预计算值
 	}
+	if explored {
+		// 探索事件日志（§5 可观测性）：选中号此时才确定，故在选中点打出。
+		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
+		// 常规路径）。
+		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
+			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
@@ -221,8 +258,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
+	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
+	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
+	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
+	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
 	return best.a
 }
 
@@ -252,22 +295,21 @@ type weighted struct {
 	cost1k float64 // CostPer1k 缓存（tier 2 排序用；tier 0/1 恒 0）
 }
 
-// expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
+// expiringWeight 快过期积分占比的权重系数（三因子之一，issue:积分过期）。
 // 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
 // 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
 const expiringWeight = 8.0
 
 // pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
 //
-//		weight = credits 比例 × 10 + idleWeight + successRate × 3
+//		weight = credits 比例 × 10 + 快过期积分占比 × expiringWeight + idleWeight
 //
 //	  - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
 //	    tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
+//	  - 快过期积分占比 = creditsExpiring/credits（×8，issue:积分过期）
 //	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
-//	  - successRate = successEMA/(successEMA+errorEMA)（EMA 衰减口径）；
-//	    无请求记录给 1.5（中性偏信任）
 //
-// credits 全 0 时仍按 idle+successRate 加权（不退化均匀随机）。
+// credits 全 0 时仍按 idle+expiring 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
 // 候选携带调用方预计算的权重（weighted.w，maxCredits/now 均已按全集口径算好），
@@ -304,8 +346,8 @@ func (p *Pool) pickWeighted(cands []weighted) *entry {
 	return cands[len(cands)-1].e
 }
 
-// weightEpsilon 等权重判定的浮点容差：权重公式微调（如 EMA 引入）后权重不再
-// 位级相等，精确相等比较会让等权重洗牌静默失效、回到字典序截断饿死问题。
+// weightEpsilon 等权重判定的浮点容差：权重公式微调后权重不再位级相等，
+// 精确相等比较会让等权重洗牌静默失效、回到字典序截断饿死问题。
 const weightEpsilon = 1e-9
 
 // weightOf 计算单个账号的三因子权重。单次 pick 内对每个候选只调用一次
@@ -343,15 +385,8 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 		}
 		w += idleW
 	}
-	// 3. 成功率 ×3（EMA 衰减口径）：successEMA/(successEMA+errorEMA) 让近期行为
-	// 主导——旧终身累计口径下历史错误是分母的永久部分，上游修复后权重永久回不来。
-	// 无请求记录（两 EMA 均零）时给 1.5（中性偏信任，同旧口径）。
-	if obs := e.successEMA + e.errorEMA; obs > 0 {
-		w += e.successEMA / obs * 3
-	} else {
-		w += 1.5 // 无请求记录 → 中性偏信任
-	}
+	// （原第 3 因子「成功率 EMA ×3」已删，success-ema-review §4：双饱和计数器对
+	// 真实成功率不敏感、成熟池退化为与默认值重合的常数 1.5、失败侧与熔断器
+	// 100% 同源——机制名存实亡且冗余，删除后 weightOf 为三因子。）
 	return w
 }
-
-// SetCredits 更新账号余额。

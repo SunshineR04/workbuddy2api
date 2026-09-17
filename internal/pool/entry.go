@@ -1,4 +1,4 @@
-// Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
+// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 package pool
 
 import (
@@ -25,6 +25,11 @@ func (k CoolKind) String() string {
 	return "unknown"
 }
 
+// degradeReason 连败降权（issue #114）写 reason 的固定文案：与冷却域的
+// reason（"429 rate limit" / "waf 403 block" / "余额不足"）共用一个字段，
+// 运维在 /status 一处即可看到「为什么被降权/冷却」，不新增台账字段。
+const degradeReason = "consecutive failures"
+
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
 	UID           string    `json:"uid"`
@@ -41,12 +46,23 @@ type Status struct {
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
+	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
+	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
+	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	SuccessCount      int64              `json:"success_count,omitempty"`
 	ErrTotal          int64              `json:"err_total,omitempty"`
 	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
 	LastErrTime       time.Time          `json:"last_err,omitempty"`
+	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
+	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
+	// 误以为"没记录"，实际是零值被 omitempty 省略）。
+	ConsecutiveFails int       `json:"consecutive_fails"`
+	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
@@ -66,6 +82,19 @@ type RateLimitedModel struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
+// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
+// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+type ModelCostStatus struct {
+	Model string `json:"model"`
+	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
+	CostPer1k float64 `json:"cost_per_1k"`
+	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
+	LastSeen time.Time `json:"last_seen"`
+	// Samples 累计观测次数（EMA 收敛度参考）。
+	Samples int `json:"samples,omitempty"`
+}
+
 type entry struct {
 	a       *auth.Auth
 	credits int64
@@ -76,18 +105,11 @@ type entry struct {
 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
-	successCount    int64 // 累计成功
-	errTotal        int64 // 累计错误（终身累计，供状态展示与 EMA 反推；选号权重改用下方 EMA）
-	// successEMA / errorEMA 成功率的 EMA 观测（替代终身累计比率做选号权重）：
-	// 旧口径 successCount/(successCount+errTotal) 终身不衰减——历史故障永久压低
-	// 权重、长寿账号区分度收敛。EMA 让近期行为主导（成功事件拉 successEMA、错误
-	// 事件拉 errorEMA，比率 = successEMA/(successEMA+errorEMA)）。alpha=0.1
-	// （比 NoteModelCost 的 0.3 更平滑——选号权重不应被单次成败主导）。
-	// 持久化（stateAccount.SuccessEMA/ErrorEMA）；旧 state.json 缺字段时从
-	// successCount/errTotal 反推初始值（向后兼容）。
-	successEMA float64
-	errorEMA   float64
-	lastErr         time.Time // 最近一次错误时间
+	successCount    int64     // 累计成功
+	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
+	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
+	errTotal    int64         // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
+	lastErr     time.Time     // 最近一次错误时间
 	lastSuccess     time.Time // 最近一次成功时间
 	coolKind        CoolKind
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
@@ -129,13 +151,26 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
+	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
+	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
+	// 是 Disable，这里的终态是临时出池（degradeUntil）。清零点：NoteSuccess。
+	// 持久化（stateAccount.ConsecutiveFails + DegradeUntil）：restart 归零会让
+	// 「上游持续故障 + 频繁重启」的组合重新学满 5 次；degradeUntil 持久化让降权期
+	// 重启不失忆（与 breakerUntil 同口径）。
+	consecutiveFails int
+	// degradeUntil 连败降权截止：非零且未到期时该账号不参与 normal 选号（临时
+	// 出池）。与冷却/熔断**取更长者不叠加**（healthy/degraded 判定统一取最远
+	// 截止），到期自动回池，无需显式复位。落盘仅未过期条目（同 breakerUntil）。
+	degradeUntil time.Time
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
-	// modelCost 实测扣费账本：model → 观测（运行态，不持久化）。
-	// 由每次成功请求的 usage.credit 折算而来（上游没有"按模型的用量"接口，
-	// get-user-resource 只给套餐级积分汇总，只能实测）。选号时据此把
-	// 「该模型上免费/便宜的号」排在前面。
+	// modelCost 实测扣费账本：model → 观测。由每次成功请求的 usage.credit
+	// 折算而来（上游没有"按模型的用量"接口，get-user-resource 只给套餐级积分
+	// 汇总，只能实测）。选号时据此把「该模型上免费/便宜的号」排在前面。
+	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
+	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）。
 	modelCost map[string]modelCostEntry
 }
 
@@ -154,7 +189,9 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 	return mc, true
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
+// 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
+// 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
 		return false
@@ -163,6 +200,9 @@ func (e *entry) healthy(now time.Time) bool {
 		return false
 	}
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return false
+	}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
 		return false
 	}
 	return true
@@ -217,6 +257,32 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	return true
 }
 
+// pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
+// pruneExpiredModelCooldowns 同形同调用点）。
+//
+// 为什么必须有它：modelCost 此前只在**读**（modelCostOf）、**落盘**（persist）、
+// **恢复**（persist）、**status**（state.go）四处做"过期过滤"，内存里的条目本身
+// 从不回收——即「map 只增不减」。而 entry.modelCost 的注释明确声称
+// 「落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）」，
+// 模型级冷却表正是靠 pruneExpiredModelCooldowns 在 pick 写锁路径做真正删除的
+//（见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
+// 永久占据一条内存（进程重启才清），并在后续每一轮 pick 的遍历、每次 status 遍历里
+// 被反复判定为过期（只是没人删）。
+//
+// 观测只在成功请求路径写入（NoteModelCost），且 model 不与目录校验，故增长受
+// "历史服务过的模型名"限制——不是无界泄漏，但同样是"只增不减"的无回收表。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelCosts(now time.Time) {
+	if len(e.modelCost) == 0 {
+		return
+	}
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			delete(e.modelCost, m)
+		}
+	}
+}
+
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
 // pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
 // 无需清理。调用方必须已持有 p.mu 写锁。
@@ -231,8 +297,9 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	}
 }
 
-// expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
-// 供全冷却兜底选取"最早到期"账号用。
+// expiry 返回账号当前仍在生效的最近冷却/熔断/降权截止时间（三个截止取最早者）；不在冷却期返回零值。
+// 供全冷却兜底选取"最早到期"账号用。连败降权计入兜底口径：降权号参与兜底（其失败
+// 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -243,12 +310,18 @@ func (e *entry) expiry(now time.Time) time.Time {
 			t = e.breakerUntil
 		}
 	}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+		if t.IsZero() || e.degradeUntil.Before(t) {
+			t = e.degradeUntil
+		}
+	}
 	return t
 }
 
-// fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却；breaker：熔断期）。
+// fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却/连败降权；breaker：熔断期）。
 // 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
-// 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft。
+// 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft
+// （连败降权与软冷却同归 soft：都按各自截止到期放行，兜底处置无差异）。
 func (e *entry) fallbackKind(now time.Time) string {
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		if e.until.IsZero() || !now.Before(e.until) || e.breakerUntil.Before(e.until) {
@@ -268,17 +341,14 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring/
-	// error_ema）不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring）
+	// 不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	// 旧文件的 success_ema/error_ema 字段读取时被忽略（无害遗留，JSON 多余键
+	// 自然丢弃，不报错不迁移——原成功率 EMA 因子已删，见 success-ema-review §4）。
 	ErrTotal    int64     `json:"err_total"`
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	LastErr     time.Time `json:"last_err,omitempty"`
-	// SuccessEMA / ErrorEMA 成功率的 EMA 观测（选号权重第 3 因子数据源，见
-	// entry.successEMA）。旧 state.json 缺字段 → 加载时从 successCount/errTotal
-	// 反推初始值（比率归一），向后兼容。
-	SuccessEMA float64 `json:"success_ema,omitempty"`
-	ErrorEMA   float64 `json:"error_ema"`
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak"`
@@ -286,6 +356,12 @@ type stateAccount struct {
 	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
 	// 零值也显式写出（运维口径，见 err_total 注释）。
 	SessionDeadFails int `json:"session_dead_fails"`
+	// ConsecutiveFails 连续失败计数（连败降权进度，见 entry.consecutiveFails）。
+	// 零值也显式写出（运维口径，同上）。
+	ConsecutiveFails int `json:"consecutive_fails"`
+	// DegradeUntil 连败降权截止（issue #114）。仅未过期才持久化（落盘/恢复均惰性
+	// 过滤），避免降权期重启失忆；过期/零值不写。指针语义同 BreakerUntil。
+	DegradeUntil *time.Time `json:"degrade_until,omitempty"`
 
 	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
 	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
@@ -306,6 +382,12 @@ type stateAccount struct {
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
 	// 6004 雷区（选号撞限流号耗尽 MaxRotate → 429）。恢复时惰性过滤已过期条目。
 	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
+	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
+	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
+	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
+	// 与运行态 modelCostEntry 字段一一对应（单一表示，内存与落盘同构不搞两套）。
+	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的 6004 独立冷却持久化记录，与运行态
@@ -316,20 +398,31 @@ type stateModelCooldown struct {
 	Reason  string    `json:"reason,omitempty"`
 }
 
+// stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
+// 字段一一对应（CostPer1k/LastSeen/Samples），落盘/恢复往返无损（EMA 值随
+// JSON 浮点原样保留，往返不引入漂移）。
+type stateModelCost struct {
+	CostPer1k float64   `json:"cost_per_1k"`
+	LastSeen  time.Time `json:"last_seen"`
+	Samples   int       `json:"samples,omitempty"`
+}
+
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
 // 单次会话，又不至于让昨天的价格决定今天的选择——过期的免费观测若永久有效，
 // 白天会把已开始收费的号继续当成免费。
 const modelCostTTL = 6 * time.Hour
 
-// modelCostEntry 运行时成本账本（独立于持久化结构，避免账本污染 state.json；
-// 成本随上游活动变化，仅内存态，重启后重新学习）。
+// modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
 type modelCostEntry struct {
 	CostPer1k float64
 	LastSeen  time.Time
 	Samples   int
 }
 
-// modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录（运行态，不持久化）。
+// modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。**已持久化**（stateAccount.ModelCooldowns
+// → stateModelCooldown，见 2f4c77b）：Until/ResetAt/Reason 三字段落盘往返无损，Hits 不落盘
+// （见字段注释）。本注释此前写「运行态，不持久化」，是 908abbd 引入本结构体时的旧状态描述，
+// 在 2f4c77b 加上持久化后未同步更新，与上方 stateModelCooldown 的「落盘/恢复往返无损」自相矛盾。
 // 承载两种「该模型在此账号上不可用」语义：
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
 //   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
@@ -379,6 +472,30 @@ const (
 // 又不会让真正的死 session 留在池里反复被选中。
 const sessionDeadThreshold = 3
 
+// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）
+// 的默认参数，与熔断器参数族同风格（SetDegrade 注入，默认值在此）。
+//   - defaultDegradeThreshold=5：比熔断阈值 3 宽——熔断管 5xx（ErrServer，确定性
+//     上游故障），连败兜底管的是 ErrClient/传输层这类「不知道原因」的失败，判据
+//     更弱，阈值须更保守以免误伤（偶发失败清零逻辑下，5 连败已是很强的异常信号）。
+//   - defaultDegradeCooldown=10m：出池时长。取软冷却封顶（2h）与熔断基数（30m）
+//     之间：长于单次软冷却（60s 级），短于熔断基数——连败的证据强度低于熔断，
+//     惩罚不应重于熔断。
+//   - defaultDegradeCooldownMax=2h：降权时长的**上限钳制**（非指数退避封顶——
+//     连败降权为固定时长，见 degrade.go 注释「不做指数升级」），对齐
+//     defaultSoftRateMax 的量级。仅当显式配置的 degrade_cooldown 大于该值时钳制。
+const (
+	defaultDegradeThreshold   = 5
+	defaultDegradeCooldown    = 10 * time.Minute
+	defaultDegradeCooldownMax = 2 * time.Hour
+)
+
+// defaultCostExploreInterval costTier 条件探索的默认窗口（issue #136 方案 a′）。
+// 取 30m：≤ 48 次/天/模型 的探索上限算术（24h/30m=48），与池规模和 QPS 无关。
+// 探索=搭车改道（把一个既有真实用户请求改道给 tier 1 号），零新增上游请求；
+// 增量成本只是「该请求本可打免费号、实际打了可能收费的号」的期望计费差，
+// 且 tier 1 枯竭（活跃模型全号已学）后税基收敛到 0。config 显式 "0" 关停。
+const defaultCostExploreInterval = 30 * time.Minute
+
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"
 
@@ -394,8 +511,3 @@ const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
 )
-
-// successAlpha 成功率 EMA 的平滑系数。取 0.1：比 NoteModelCost 的 0.3 更平滑——
-// 选号权重不应被单次成败主导（约 10 次观测收敛），又能让「上游修复后的连续成功」
-// 在十几次请求内把权重拉回来（旧终身累计口径下历史错误是分母的永久部分，永不可恢复）。
-const successAlpha = 0.1

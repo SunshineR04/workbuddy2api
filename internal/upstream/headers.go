@@ -221,8 +221,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
+	// （见 auth.AccessTokenValue 注释与 upstream.TestChatHeadersRacesRefreshToken）。
+	if at := a.AccessTokenValue(); at != "" {
+		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
@@ -242,8 +244,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		} else {
 			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
-		if a.Domain != "" {
-			req.Header.Set("X-Domain", a.Domain)
+		if d := a.DomainValue(); d != "" {
+			req.Header.Set("X-Domain", d)
 		} else {
 			req.Header.Set("X-No-Department-Info", "1")
 		}
@@ -392,7 +394,8 @@ func ExtractClientIP(r *http.Request) string {
 //     （官方 banner/check-in 显式覆写 UA 的形态，不带 CLI 段）；
 //  3. 显式 client_name="SaaS" → 不设置（Go 客户端自带默认 UA，还原旧行为）。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照（同 ChatHeaders：keepalive 可在 a.mu 内改写）。
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
@@ -410,8 +413,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)

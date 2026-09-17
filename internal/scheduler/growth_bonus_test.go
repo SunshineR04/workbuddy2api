@@ -51,8 +51,15 @@ func (s *bonusChainStub) streakCallBudget() int {
 }
 
 func (s *bonusChainStub) handler() http.Handler {
-	yest := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 昨日日期必须与生产侧同口径（CST 自然日）：判据侧是
+		// upstream.GrowthYesterdayDate(time.Now()) → scheduler.makeupYesterday，
+		// 热力图 date 也是 CST 自然日。travelDay 是本包 CST 自然日的唯一口径，
+		// 用它彻底避开进程本地时区（容器恒 UTC）。若按本地时区取 AddDate(-1)，
+		// 则在 UTC 16:00–24:00（= CST 次日 00:00–08:00）窗口内标签整体错一天：
+		// HeatmapDayScore 查不到「昨日」格 → makeupYesterday 早退 → 不发补签 use
+		//（每天固定 8 小时的时序性红灯）。按请求现算，避免跨 CST 零点冻住标签。
+		yest := travelDay(time.Now().AddDate(0, 0, -1))
 		switch r.URL.Path {
 		case "/v2/report":
 			w.Write([]byte(`{"code":0,"msg":"OK"}`))

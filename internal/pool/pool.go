@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,23 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
+	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
+	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
+	// 0 = 关停（完全回到现状行为）。
+	costExploreInterval time.Duration
+	// exploreLast 各 (realm, 模型) 的上次探索时刻，键 = realm + "\x1f" + model。
+	// 运行态（不持久化，同 lastUsed/usedSeq 口径）：重启归零 → 每个仍冻结的
+	// (域, 模型) 多至 1 次即时重探；已毕业号经 ModelCosts 恢复 tier，学费不重付。
+	// 只在探索事件时写入（tier 1 枯竭期间停走，陈旧无害）；不做对称清理。
+	exploreLast map[string]time.Time
+	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
+	costExploreEvents int64
+	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
+	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
+	degradeThreshold   int
+	degradeCooldown    time.Duration
+	degradeCooldownMax time.Duration
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -64,6 +82,13 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		degradeThreshold:   defaultDegradeThreshold,
+		degradeCooldown:    defaultDegradeCooldown,
+		degradeCooldownMax: defaultDegradeCooldownMax,
+		// 探索缺省 30m：tier 0 垄断下的 tier 1 探索窗口（issue #136）。用户经
+		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
+		costExploreInterval: defaultCostExploreInterval,
+		exploreLast:         map[string]time.Time{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -94,6 +119,50 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用，
+// issue #136）。0 = 关停（完全回到现状行为）；正值覆盖默认 30m。
+// 注意：与 SetSoftRateMax「非正值保留默认」不同，0 在这里是**合法值**（关停开关，
+// 与 config 的 "0" 关停语义对齐）——不设 0 语义就无法关停探索。
+func (p *Pool) SetCostExploreInterval(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d < 0 {
+		return // 负值非法，保留现值
+	}
+	p.costExploreInterval = d
+}
+
+// CostExploreStatus 透出探索台账（/status 用）：累计探索事件数 + 各 (域, 模型)
+// 的最近探索时刻（键内 \x1f 分隔符输出为 "|"，与 model_costs 行对照即可读出
+// 「探索→毕业」全链路）。RLock 只读遍历；map 大小受「服务过的 (域, 模型)」集合
+// 约束（与 modelCost 同界，天然有界）。
+func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	last = make(map[string]time.Time, len(p.exploreLast))
+	for k, ts := range p.exploreLast {
+		// 键 realm+"\x1f"+model → 输出 "|"（JSON 安全可读；\x1f 不可打印）。
+		last[strings.ReplaceAll(k, "\x1f", "|")] = ts
+	}
+	return p.costExploreEvents, last
+}
+
+// SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
+// 非正值保留原值（用默认，见 defaultDegrade*），风格同 SetBreaker/SetSoftRateMax。
+func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if threshold > 0 {
+		p.degradeThreshold = threshold
+	}
+	if cooldown > 0 {
+		p.degradeCooldown = cooldown
+	}
+	if cooldownMax > 0 {
+		p.degradeCooldownMax = cooldownMax
 	}
 }
 
@@ -151,11 +220,12 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
-	limit := p.inFlightLimit(e)
-	p.mu.RUnlock()
 	if !ok {
+		p.mu.RUnlock()
 		return false
 	}
+	limit := p.inFlightLimit(e)
+	p.mu.RUnlock()
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
