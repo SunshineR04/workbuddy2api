@@ -200,6 +200,29 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
+// wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
+// 网络栈/DNS 1-2s 才恢复（issue #152 实测 dial tcp lookup no such host 与
+// Kernel-Power 507 standby exit ≤1s 重合），宽限 5s 覆盖 90%+ 唤醒场景。
+// 只对迟到补跑生效（准点触发零延迟），零配置（分析报告裁定全套配置不成比例）。
+// 测试可缩短（与 travelAccountDelay「测试可置 0」同口径）。
+var wakeupGraceDelay = 5 * time.Second
+
+// wakeupLateThreshold 迟到判定阈值：now 晚于槽位计划时刻超过 1s 才算迟到补跑。
+// 毫秒级抖动（timer 正常触发的偏移量级）不算，避免准点触发被误宽限。
+const wakeupLateThreshold = 1 * time.Second
+
+// awaitWakeupGrace 迟到唤醒补跑派发前的网络宽限：槽位时刻已过点超过阈值
+// （机器刚从睡眠唤醒）时先等满 wakeupGraceDelay 让网络栈/DNS 就绪再派发。
+// 准点/阈值内抖动零延迟直接放行。ctx 取消立即返回 false（优雅停机不等宽限睡满，
+// 本批放弃，下轮 nextWake 照旧从"现在"起算）。返回是否继续派发。
+func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
+	if late := time.Since(planned); late <= wakeupLateThreshold {
+		return ctx.Err() == nil // 准点触发：零延迟放行
+	}
+	log.Printf("wakeup grace %s: late catch-up for slot %s", wakeupGraceDelay, planned.Format("15:04"))
+	return sleepCtx(ctx, wakeupGraceDelay)
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
@@ -216,6 +239,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
+			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
+			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
+			// 的窗口里（issue #152）；准点触发零延迟不受影响。
+			if !awaitWakeupGrace(ctx, next) {
+				return // ctx 取消：放弃本批，优雅退出
+			}
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
 			// 54 号 × 5 条 ≈ 7-8 分钟睡眠）不再阻塞同槽其他任务族；返回前
 			// 等全部任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠
