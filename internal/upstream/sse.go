@@ -49,6 +49,19 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// 供缺 index 时按 id 归位既有调用（见 mergeToolCallsChunk 注释）。
 		idIndex = map[string]int{}
 	)
+	// appendContent 是「已取到正文」（gotAnyContent latch）的唯一写入点：delta 与
+	// message 两路 content 都必须经此并入，规约只有一份（issue #142）——
+	//   S1 空串不算「已取到正文」、不占 latch 名额：OpenAI 风格 role-only 首帧
+	//      （delta.content=""）和整条空 message 帧是常态帧，若空串置位 latch，
+	//      后续真正文会被 message 回退分支的 !gotAnyContent 守卫静默拒绝；
+	//   S2 空串本身也无可追加字节，跳过 WriteString 与追加语义自洽。
+	appendContent := func(txt string) {
+		if txt == "" {
+			return
+		}
+		content.WriteString(txt)
+		gotAnyContent = true
+	}
 	// mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
 	// delta（流式分片，按 index 累积）与 message（非 delta 整条）共用同一合并逻辑，
 	// 保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
@@ -117,8 +130,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			role = r2
 		}
 		if txt, ok := msg["content"].(string); ok {
-			content.WriteString(txt)
-			gotAnyContent = true
+			appendContent(txt)
 		}
 		if rc, ok := msg["reasoning_content"].(string); ok {
 			reasoning.WriteString(rc)
@@ -170,8 +182,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 									role = r2
 								}
 								if txt, ok := delta["content"].(string); ok {
-									content.WriteString(txt)
-									gotAnyContent = true
+									appendContent(txt)
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
 									reasoning.WriteString(rc)

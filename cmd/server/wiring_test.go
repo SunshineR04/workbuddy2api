@@ -104,7 +104,10 @@ func TestModelJSONPath(t *testing.T) {
 		{"", ""},
 	}
 	for _, c := range cases {
-		if got := modelJSONPath(c.state); got != filepath.ToSlash(c.want) {
+		// 归一化 got 侧：modelJSONPath 走 filepath.Join，Windows 产出反斜杠；
+		// want 本就是正斜杠字面量（跨平台规范形式），对 want 做 ToSlash 是无操作，
+		// 反斜杠会原样留在 got 里导致断言在 Windows 必然失败。
+		if got := filepath.ToSlash(modelJSONPath(c.state)); got != c.want {
 			t.Errorf("modelJSONPath(%q)=%q want %q", c.state, got, c.want)
 		}
 	}

@@ -20,6 +20,9 @@ import (
 // 一致），切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
 // （"将在 … 重置"），按字节切会出半截序列乱码。短于 n 原样返回；n<=0 返回空串。
 func Truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	s = strings.TrimSpace(s)
 	if len(s) > n {
 		// s[n] 是切点后的首字节：是 rune 的后续字节（continuation）说明切点落在
