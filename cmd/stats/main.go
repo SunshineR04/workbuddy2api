@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -74,6 +75,7 @@ func main() {
 		width    = flag.Int("width", 0, "按指定列宽排版（0 = 自动探测终端宽度）")
 		height   = flag.Int("height", 0, "按指定行数排版（0 = 自动探测终端高度）")
 		altScr   = flag.Bool("alt-screen", false, "watch 用备用屏幕缓冲绘制（退出时还原原屏，推荐）")
+		server   = flag.String("server", "", "网关基址（覆盖 config.json 的 listen），如 http://127.0.0.1:7863")
 		showHelp = flag.Bool("h", false, "显示帮助")
 	)
 	flag.Usage = func() {
@@ -88,12 +90,12 @@ func main() {
 
 	// -watch 与 -json 互斥：watch 会给每帧加光标控制转义，JSON 消费者无法解析；
 	// 而 watch 的意义是"人看着刷新"，与机器消费本就互斥。
-	if err := validateFlags(*watch, *jsonOut); err != nil {
+	if err := validateFlags(*watch, *jsonOut, *sortKey); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(2)
 	}
 
-	baseURL, apiKey, err := resolveGateway()
+	baseURL, apiKey, err := resolveGateway(*server)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "解析网关地址失败: %v\n", err)
 		os.Exit(1)
@@ -136,47 +138,103 @@ func resolveLayout(width, height int) layout {
 }
 
 // validateFlags 校验参数组合。单独成函数便于测试（main 直接 os.Exit）。
-func validateFlags(watch time.Duration, jsonOut bool) error {
+func validateFlags(watch time.Duration, jsonOut bool, sortKey string) error {
 	if watch > 0 && jsonOut {
 		return fmt.Errorf("-watch 与 -json 不能同时使用（watch 用于人看，json 用于脚本消费）")
+	}
+	// 排序字段白名单：非法值若不拦，sortModels 的 switch 会静默落到默认排序——
+	// 用户以为按 ttfb 排了、实际按 requests，是「看不出错」的错误。
+	// 与 stats.ps1 的 [ValidateSet] 同口径（两个入口行为一致）。
+	switch sortKey {
+	case "requests", "ttfb", "tokens", "credit":
+	default:
+		return fmt.Errorf("-sort 取值 %q 无效（可选：requests|ttfb|tokens|credit）", sortKey)
 	}
 	return nil
 }
 
 // resolveGateway 决定网关地址与 api_key。
 //
-// 优先级：WB2A_URL > config.json 的 listen/api_key。与 checkin.sh、start.ps1
-// 的解析口径保持一致，避免同一台机器上两套工具的地址来源不同。
-func resolveGateway() (baseURL, apiKey string, err error) {
-	if u := os.Getenv("WB2A_URL"); u != "" {
-		return strings.TrimRight(u, "/"), os.Getenv("WB2A_API_KEY"), nil
-	}
-
+// 优先级（地址）：-server flag > WB2A_URL > config.json 的 listen。
+// key 来源：WB2A_API_KEY > config.json 的 api_key。
+//
+// 与 cmd/acct 的 resolveTarget 同口径：-server 只覆盖**地址**，key 仍从配置文件读
+// ——否则「只想指定地址」的用户会意外丢掉鉴权（实测 401）。
+func resolveGateway(serverOverride string) (baseURL, apiKey string, err error) {
 	cfgPath := os.Getenv("WB2A_CONFIG")
 	if cfgPath == "" {
 		cfgPath = "config.json"
 	}
 	raw, rerr := os.ReadFile(cfgPath)
-	if rerr != nil {
-		// 无配置文件不直接失败：允许仅靠 WB2A_URL 使用；这里给出可操作的提示。
-		return "", "", fmt.Errorf("读取 %s 失败（可用 WB2A_URL 直接指定网关地址）: %w", cfgPath, rerr)
+	if rerr == nil {
+		var cfg struct {
+			Listen string `json:"listen"`
+			APIKey string `json:"api_key"`
+		}
+		if uerr := json.Unmarshal(raw, &cfg); uerr != nil {
+			return "", "", fmt.Errorf("解析 %s 失败: %w", cfgPath, uerr)
+		}
+		// 环境变量优先于文件（与 cmd/acct 一致）。
+		apiKey = cfg.APIKey
+		if k := os.Getenv("WB2A_API_KEY"); k != "" {
+			apiKey = k
+		}
+		if s := strings.TrimSpace(serverOverride); s != "" {
+			return strings.TrimRight(s, "/"), apiKey, nil
+		}
+		if u := os.Getenv("WB2A_URL"); u != "" {
+			return strings.TrimRight(u, "/"), apiKey, nil
+		}
+		return normalizeListen(cfg.Listen), apiKey, nil
 	}
 
-	var cfg struct {
-		Listen string `json:"listen"`
-		APIKey string `json:"api_key"`
+	// 无配置文件：仅当地址可由 flag/env 提供时才继续（否则无从连接）。
+	apiKey = os.Getenv("WB2A_API_KEY")
+	if s := strings.TrimSpace(serverOverride); s != "" {
+		return strings.TrimRight(s, "/"), apiKey, nil
 	}
-	if uerr := json.Unmarshal(raw, &cfg); uerr != nil {
-		return "", "", fmt.Errorf("解析 %s 失败: %w", cfgPath, uerr)
+	if u := os.Getenv("WB2A_URL"); u != "" {
+		return strings.TrimRight(u, "/"), apiKey, nil
 	}
+	return "", "", fmt.Errorf("读取 %s 失败（可用 -server 或 WB2A_URL 直接指定网关地址）: %w", cfgPath, rerr)
+}
 
-	port := 7863 // 与 config.example.json 默认一致
-	if i := strings.LastIndex(cfg.Listen, ":"); i >= 0 {
-		if p, perr := strconv.Atoi(strings.TrimSpace(cfg.Listen[i+1:])); perr == nil && p > 0 {
-			port = p
+// normalizeListen 把配置里的 listen（":7863" / "0.0.0.0:7863" / "127.0.0.1:7863"）
+// 归一成本机可访问的 http 基址。监听通配地址时收敛到回环——本工具总是和网关同机运行，
+// 往 0.0.0.0 / :: 发请求在部分平台会直接失败。
+//
+// 用 net.SplitHostPort 而非手工切冒号：IPv6 字面量（"::" / "[::]:7863"）本身含冒号，
+// `strings.LastIndex(listen, ":")` 会把 "::" 切成 host=":" port=""，拼出
+// "http://::7863" 这种非法基址。
+//
+// 与 cmd/acct 的同名函数逐字一致：两处若各写一份，IPv6 边界会有一处先走样。
+func normalizeListen(listen string) string {
+	listen = strings.TrimSpace(listen)
+	if listen == "" {
+		return "http://127.0.0.1:7863"
+	}
+	host, port := "", ""
+	if h, p, err := net.SplitHostPort(listen); err == nil {
+		host, port = h, p
+	} else {
+		// 无冒号（"7863"）或畸形：把纯数字整体当端口，否则当 host。
+		if _, convErr := strconv.Atoi(listen); convErr == nil {
+			port = listen
+		} else {
+			// SplitHostPort 失败也可能是 "[::]:x" 这类缺端口的写法，退一步处理。
+			host = strings.Trim(strings.TrimSuffix(listen, ":"), "[]")
 		}
 	}
-	return "http://127.0.0.1:" + strconv.Itoa(port), cfg.APIKey, nil
+	if port == "" {
+		port = "7863"
+	}
+	switch host {
+	// ":" 是裸 "::" 经 SplitHostPort 的产物（Go 把 "::" 解析为 host=":"）；
+	// 这些写法都表示「监听全部网卡」，统一收敛到回环。
+	case "", "0.0.0.0", "::", ":":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 // fetch 拉取并解析 /v1/stats。

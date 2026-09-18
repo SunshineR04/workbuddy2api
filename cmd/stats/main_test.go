@@ -25,7 +25,7 @@ func TestResolveGatewayFromConfig(t *testing.T) {
 	t.Setenv("WB2A_CONFIG", cfg)
 	t.Setenv("WB2A_URL", "")
 
-	base, key, err := resolveGateway()
+	base, key, err := resolveGateway("")
 	if err != nil {
 		t.Fatalf("resolveGateway: %v", err)
 	}
@@ -46,8 +46,13 @@ func TestResolveGatewayListenForms(t *testing.T) {
 		{`{"listen":":7863"}`, "http://127.0.0.1:7863"},
 		{`{"listen":"0.0.0.0:8080"}`, "http://127.0.0.1:8080"},
 		{`{"listen":"127.0.0.1:9000"}`, "http://127.0.0.1:9000"},
-		{`{"listen":"bad"}`, "http://127.0.0.1:7863"}, // 无法解析 → 默认端口
-		{`{}`, "http://127.0.0.1:7863"},               // 缺字段 → 默认端口
+		{`{"listen":"[::]:7863"}`, "http://127.0.0.1:7863"}, // IPv6 通配 → 收敛回环
+		{`{"listen":"::"}`, "http://127.0.0.1:7863"},        // 裸 :: （手工切冒号会拼出非法基址）
+		{`{"listen":"localhost:9999"}`, "http://localhost:9999"},
+		// 非数字非地址的整串按 host 处理（normalizeListen 语义：SplitHostPort 失败且
+		// 非纯数字 → 视为 host，缺端口补默认）。与 cmd/acct 逐字一致。
+		{`{"listen":"bad"}`, "http://bad:7863"},
+		{`{}`, "http://127.0.0.1:7863"}, // 缺字段 → 默认端口
 	}
 	for _, c := range cases {
 		dir := t.TempDir()
@@ -56,7 +61,7 @@ func TestResolveGatewayListenForms(t *testing.T) {
 		t.Setenv("WB2A_CONFIG", cfg)
 		t.Setenv("WB2A_URL", "")
 
-		base, _, err := resolveGateway()
+		base, _, err := resolveGateway("")
 		if err != nil {
 			t.Fatalf("listen=%s: %v", c.listen, err)
 		}
@@ -72,7 +77,7 @@ func TestResolveGatewayURLOverride(t *testing.T) {
 	t.Setenv("WB2A_API_KEY", "sk-env")
 	t.Setenv("WB2A_CONFIG", "/nonexistent/config.json")
 
-	base, key, err := resolveGateway()
+	base, key, err := resolveGateway("")
 	if err != nil {
 		t.Fatalf("resolveGateway: %v", err)
 	}
@@ -89,7 +94,7 @@ func TestResolveGatewayURLOverride(t *testing.T) {
 func TestResolveGatewayMissingConfig(t *testing.T) {
 	t.Setenv("WB2A_URL", "")
 	t.Setenv("WB2A_CONFIG", filepath.Join(t.TempDir(), "nope.json"))
-	_, _, err := resolveGateway()
+	_, _, err := resolveGateway("")
 	if err == nil {
 		t.Fatal("配置缺失应报错")
 	}
@@ -105,7 +110,7 @@ func TestResolveGatewayBadJSON(t *testing.T) {
 	_ = os.WriteFile(cfg, []byte(`{not json`), 0o600)
 	t.Setenv("WB2A_URL", "")
 	t.Setenv("WB2A_CONFIG", cfg)
-	if _, _, err := resolveGateway(); err == nil {
+	if _, _, err := resolveGateway(""); err == nil {
 		t.Fatal("非法 JSON 应报错")
 	}
 }
@@ -596,18 +601,85 @@ func TestBuildFrameNoData(t *testing.T) {
 	}
 }
 
-// TestValidateFlags watch 与 json 互斥。
+// TestValidateFlags watch/json 互斥 + -sort 白名单。
 func TestValidateFlags(t *testing.T) {
-	if err := validateFlags(0, true); err != nil {
+	if err := validateFlags(0, true, "requests"); err != nil {
 		t.Errorf("仅 -json 应通过，得到 %v", err)
 	}
-	if err := validateFlags(5*time.Second, false); err != nil {
+	if err := validateFlags(5*time.Second, false, "requests"); err != nil {
 		t.Errorf("仅 -watch 应通过，得到 %v", err)
 	}
-	if err := validateFlags(5*time.Second, true); err == nil {
+	if err := validateFlags(5*time.Second, true, "requests"); err == nil {
 		t.Error("-watch 与 -json 同时使用应报错")
 	} else if !strings.Contains(err.Error(), "json") {
 		t.Errorf("错误应点明冲突的选项，得到 %v", err)
+	}
+
+	// -sort：四个合法值全通过。
+	for _, k := range []string{"requests", "ttfb", "tokens", "credit"} {
+		if err := validateFlags(0, false, k); err != nil {
+			t.Errorf("-sort=%s 应通过，得到 %v", k, err)
+		}
+	}
+	// 非法值必须报错，不能静默落到默认排序（用户会以为按 ttfb 排了）。
+	for _, bad := range []string{"", "invalid", "Requests", "req"} {
+		err := validateFlags(0, false, bad)
+		if err == nil {
+			t.Errorf("-sort=%q 应报错（静默回落会掩盖用户笔误）", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "sort") {
+			t.Errorf("-sort 错误应点明选项名，得到 %v", err)
+		}
+	}
+}
+
+// TestNormalizeListen 与 cmd/acct 的 TestNormalizeListen 同表：两处实现必须逐字
+// 一致，任一处的 IPv6 边界先走样都会导致同机两个工具解析出不同地址。
+func TestNormalizeListen(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{":7863", "http://127.0.0.1:7863"},
+		{"0.0.0.0:7863", "http://127.0.0.1:7863"},
+		{"::", "http://127.0.0.1:7863"},
+		{"[::]:7863", "http://127.0.0.1:7863"},
+		{"127.0.0.1:7863", "http://127.0.0.1:7863"},
+		{"localhost:9999", "http://localhost:9999"},
+		{"", "http://127.0.0.1:7863"},           // 空 → 默认端口
+		{"127.0.0.1:", "http://127.0.0.1:7863"}, // 有 host 无端口
+		{"7863", "http://127.0.0.1:7863"},       // 只有端口（无冒号 host 段）
+	}
+	for _, c := range cases {
+		if got := normalizeListen(c.in); got != c.want {
+			t.Errorf("normalizeListen(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestResolveGatewayServerOverride -server flag 只覆盖地址，key 仍从配置读。
+func TestResolveGatewayServerOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	_ = os.WriteFile(cfg, []byte(`{"listen":"127.0.0.1:1111","api_key":"from-config"}`), 0o600)
+	t.Setenv("WB2A_CONFIG", cfg)
+	t.Setenv("WB2A_URL", "http://127.0.0.1:2222")
+	t.Setenv("WB2A_API_KEY", "")
+
+	// -server 覆盖地址；key 来自配置文件（否则「只想换地址」会意外 401）。
+	base, key, err := resolveGateway("http://127.0.0.1:3333/")
+	if err != nil {
+		t.Fatalf("resolveGateway: %v", err)
+	}
+	if base != "http://127.0.0.1:3333" {
+		t.Errorf("-server 应覆盖地址且去掉尾斜杠，得到 %q", base)
+	}
+	if key != "from-config" {
+		t.Errorf("-server 下 key 应来自 config.json，得到 %q", key)
+	}
+
+	// 显式 WB2A_API_KEY 优先于文件。
+	t.Setenv("WB2A_API_KEY", "from-env")
+	if _, key, _ := resolveGateway("http://127.0.0.1:3333"); key != "from-env" {
+		t.Errorf("WB2A_API_KEY 应优先于 config.json，得到 %q", key)
 	}
 }
 
