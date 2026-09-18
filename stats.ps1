@@ -2,7 +2,7 @@
 <#
 stats.ps1 — 网关请求统计的终端视图（按模型）
 
-数据源是网关的 GET /v1/stats（本仓库 internal/metrics 采集）。
+数据源是网关的 GET /v1/stats（internal/server/metrics.go 采集）。
 无状态、用完即退：不像常驻面板那样占内存，也不引入任何额外依赖。
 
 用法:

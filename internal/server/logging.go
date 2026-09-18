@@ -128,8 +128,6 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
-	// 用宽松 map 解析：usage 字段名在不同模型/区域间有差异（见 UsageDetail 注释），
-	// 结构体标签写死会漏字段。
 	var chunk struct {
 		Usage *struct {
 			CompletionTokens int      `json:"completion_tokens"`
