@@ -162,28 +162,19 @@ func TestChatStreamContextSinglePathNoPanic(t *testing.T) {
 	rc.Close()
 }
 
-// cancelObserver 断言 fallback 场景下每条路径的 cancel 均被调用。
+// TestChatStreamContextFallbackCancelsEachAttempt 断言错误路径的 reqCtx cancel
+// 在返回前被调用（P0-1 原语义的收窄版：#119 后 global 单路径 /v2，无 fallback 链；
+// 保留对「404 分支显式 cancel」的守卫）。global 账号出站恒 /v2/chat/completions。
 func TestChatStreamContextFallbackCancelsEachAttempt(t *testing.T) {
-	// global 账号走双路径 [console, /v2]：首路径 404 → fallback；两路径的
-	// reqCtx cancel 都必须被调用（路径一在 continue 前、路径二在返回前/monitorBody 持有）。
 	cancelled := make(chan struct{}, 4)
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			// 监视 reqCtx：任一路径的 cancel 应传播到 r.Context()。
+			// 监视 reqCtx：错误分支返回前 cancel 应传播到 r.Context()。
 			go func() {
 				<-r.Context().Done()
 				cancelled <- struct{}{}
 			}()
-			switch r.URL.Path {
-			case "/console/chat/completions":
-				return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
-			default:
-				return &http.Response{
-					StatusCode: 200,
-					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-					Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
-				}, nil
-			}
+			return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
 		})},
 		ChatBaseCN:     "https://chat.example",
 		ChatBaseGlobal: "https://chat-global.example",
@@ -195,25 +186,23 @@ func TestChatStreamContextFallbackCancelsEachAttempt(t *testing.T) {
 	// 已文档化取舍（取消传播交 http.Transport），不在本测试射程。
 	c.IdleTimeout = time.Second
 
-	rc, status, _, err := c.ChatStreamContext(context.Background(),
+	_, status, _, err := c.ChatStreamContext(context.Background(),
 		globalAuth(), []byte(`{"model":"m"}`), "", ChatMeta{ConversationRequestID: "req-p01-b"})
-	if err != nil || status != 200 {
-		t.Fatalf("fallback: status=%d err=%v", status, err)
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrNotFound || status != 404 {
+		t.Fatalf("chat 404: want status=404 + *Error{not_found}, got status=%d err=%v", status, err)
 	}
-	rc.Close() // monitorBody Close → cancel 路径二
 
-	// 两条路径的 cancel 均须触发（路径一：404 分支显式 cancel；路径二：rc.Close → cancel）。
-	for i := 0; i < 2; i++ {
-		select {
-		case <-cancelled:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("attempt %d: reqCtx cancel not observed (fallback 路径泄漏 cancel)", i+1)
-		}
+	// 错误分支 cancel 必须触发（404 分支显式 cancel，不再有 fallback 二次请求）。
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("reqCtx cancel not observed (错误路径泄漏 cancel)")
 	}
 }
 
 // TestChatStreamContextCompileGuarantee P0-1 静态面：不可达尾代码已删。
-// 通过编译期保证 + 运行期双路径全失败（首 404 → fallback 也失败）仍正常返回错误，
+// 通过编译期保证 + 运行期单路径失败（/v2 404，#119 后无 fallback）仍正常返回错误，
 // 不落入旧的「循环尾 cancel(); return nil,0,nil,nil」假路径（吞错误返回 nil,nil）。
 func TestChatStreamContextCompileGuarantee(t *testing.T) {
 	c := &Client{

@@ -169,27 +169,20 @@ func TestChatConversationRequestIDInboundPassthrough(t *testing.T) {
 	}
 }
 
-// TestChatAGlobalPathAndFallbackReuseConvReqID global realm /console → /v2 fallback：
-// 同一 ChatStream 内两条候选路径出站复用同一 conversationRequestID（换路径不改聚合键）。
-func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
+// TestChatAGlobalPathReuseConvReqID global realm /v2 单路径（#119 后无 fallback）：
+// 出站打 /v2/chat/completions 恰一次，conversationRequestID 与 B3 头族完整。
+// （旧 fallback 复用 ConvReqID 语义随 [console→v2] 双路径移除而退役。）
+func TestChatAGlobalPathReuseConvReqID(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
 	var headers []http.Header
-	reqs := 0
+	var paths []string
 	up := &upstream.Client{
 		GlobalEnabled: true,
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			reqs++
+			paths = append(paths, r.URL.Path)
 			headers = append(headers, r.Header.Clone())
-			// 首次路径（console）404 → 触发 fallback 到 /v2。
-			if reqs == 1 {
-				return &http.Response{
-					StatusCode: 404,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"code":404}`)),
-				}, nil
-			}
 			return &http.Response{
 				StatusCode: 200,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -208,21 +201,17 @@ func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (global /v2 fallback)", rec.Code, rec.Body)
+		t.Fatalf("code=%d body=%s (global /v2 single path)", rec.Code, rec.Body)
 	}
-	if reqs != 2 {
-		t.Fatalf("reqs=%d want 2 (console 404 → fallback /v2)", reqs)
+	if len(paths) != 1 || paths[0] != "/v2/chat/completions" {
+		t.Fatalf("paths=%v want exactly [/v2/chat/completions] (single path, no fallback)", paths)
 	}
 	if headers[0].Get("X-Conversation-Request-ID") == "" {
-		t.Fatal("console attempt missing X-Conversation-Request-ID")
-	}
-	if headers[0].Get("X-Conversation-Request-ID") != headers[1].Get("X-Conversation-Request-ID") {
-		t.Errorf("console vs /v2 fallback conversationRequestID differ: %q vs %q",
-			headers[0].Get("X-Conversation-Request-ID"), headers[1].Get("X-Conversation-Request-ID"))
+		t.Fatal("global /v2 attempt missing X-Conversation-Request-ID")
 	}
 	// global 侧头族同样完整：CN/global 同构。
 	if headers[0].Get("X-B3-TraceId") == "" || headers[0].Get("X-B3-SpanId") == "" {
-		t.Errorf("global console attempt missing B3 family: trace=%q span=%q",
+		t.Errorf("global /v2 attempt missing B3 family: trace=%q span=%q",
 			headers[0].Get("X-B3-TraceId"), headers[0].Get("X-B3-SpanId"))
 	}
 }
@@ -322,5 +311,31 @@ func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
 	}
 	if a != b {
 		t.Errorf("会话键路径应跨轮稳定（不受末条 user 变化影响）: %q vs %q", a, b)
+	}
+}
+
+// TestChatImageTurnAggregation 纯图 body 两次经 /v1/chat/completions：出站
+// X-Conversation-Request-ID 同值（contentSignature 修复 G1——原为请求级随机
+// 碎片化；审计 §3.1 探针用例转正）。带文本的下一轮换键（跨轮不混并）。
+func TestChatImageTurnAggregation(t *testing.T) {
+	imgBody := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]}]}`
+	first := turnRequestIDForBody(t, imgBody)
+	second := turnRequestIDForBody(t, imgBody)
+	if first == "" {
+		t.Fatal("纯图请求应派生轮级聚合 ID（G1：原请求级随机）")
+	}
+	if first != second {
+		t.Errorf("纯图同 body 两次出站应同聚合 ID: %q vs %q", first, second)
+	}
+	if !isValidB3Trace(first) {
+		t.Errorf("轮级 id %q want 32 hex", first)
+	}
+	// 跨轮：末条 user 换成文本 → 换键。
+	next := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]},`+
+		`{"role":"assistant","content":"答"},{"role":"user","content":"继续"}]}`)
+	if next == "" || next == first {
+		t.Errorf("下一轮（末条 user 换文本）应换聚合键: first=%q next=%q", first, next)
 	}
 }

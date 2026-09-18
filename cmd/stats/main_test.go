@@ -199,10 +199,10 @@ func TestFetchConnectionError(t *testing.T) {
 
 // ─── 渲染：字段缺失与未启用 ───────────────────────────────────────────────
 
-// TestRenderDisabled 网关未启用统计时给出配置指引。
+// TestRenderDisabled 网关返回未启用载荷时透传其原始说明。
 func TestRenderDisabled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"enabled":false,"message":"统计未启用（server.metrics_enabled=false）"}`))
+		_, _ = w.Write([]byte(`{"enabled":false,"message":"统计载荷缺失"}`))
 	}))
 	defer srv.Close()
 
@@ -214,7 +214,7 @@ func TestRenderDisabled(t *testing.T) {
 	if !strings.Contains(out, "未启用") {
 		t.Errorf("应提示未启用，得到: %s", out)
 	}
-	if !strings.Contains(out, "metrics_enabled") {
+	if !strings.Contains(out, "统计载荷缺失") {
 		t.Errorf("应保留网关原始说明，得到: %s", out)
 	}
 }

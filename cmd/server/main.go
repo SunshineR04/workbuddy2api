@@ -72,6 +72,11 @@ func main() {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
+	// auths 目录热加载：新增凭证文件自动进池，免去「加完账号手动重启网关」。
+	// 启动时的 SyncToDir 已建立基线，监听只在后续目录内容变化时触发（见 pool/watch.go）。
+	stopWatch := p.StartAuthDirWatch(cfg.AuthDir)
+	defer stopWatch()
+
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	// 连败降权（issue #114）：ErrClient/传输层连败 N 次临时出池。
@@ -211,6 +216,8 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 运维管理端点开关（config admin.enabled，默认 false）。
+		AdminEnabled: cfg.Admin.Enabled,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

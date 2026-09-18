@@ -720,9 +720,9 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error, lay layout) [
 
 	// 标题说明统计口径：这里的时间是**统计窗口**，不是进程 uptime。
 	//
-	// since 持久化在网关的 metrics.json 里、跨重启保留（只在 reset 或删文件时
-	// 重置），因此进程重启后窗口仍从原起点续算。若写成"运行 XXh"会被误读为
-	// 进程已运行多久，故同时给出窗口时长与起始时刻，避免歧义。
+	// since 来自网关侧的纯内存累加器（上游实现），进程重启即清零。若写成
+	// "运行 XXh" 会被误读为进程已运行多久，故同时给出窗口时长与起始时刻，
+	// 避免歧义。
 	title := "📈 网关请求统计"
 	if st != nil && st.UptimeSec > 0 {
 		win := "窗口 " + humanDuration(time.Duration(st.UptimeSec)*time.Second)
@@ -772,13 +772,13 @@ func buildFrame(st *statsResponse, sortKey string, fetchErr error, lay layout) [
 	if !st.Enabled {
 		msg := st.Message
 		if msg == "" {
-			msg = "请在网关配置中设置 server.metrics_enabled=true"
+			msg = "网关未返回统计载荷"
 		}
 		return append(lines, rule, "⚠ 网关未启用请求统计", fitLine("  "+msg, lay.width))
 	}
 
 	if len(st.Models) == 0 {
-		return append(lines, rule, fitLine("暂无数据 —— 统计窗口内没有请求记录（-json 可取原始字段）", lay.width))
+		return append(lines, rule, fitLine("暂无数据 —— 统计窗口内没有请求记录（网关重启会清零，-json 可取原始字段）", lay.width))
 	}
 
 	lines = append(lines, rule)

@@ -57,7 +57,7 @@ func newRealmFake(t *testing.T) *realmFake {
 }
 
 // TestChatRealmSelectionAndBodyRewrite 断言 realm 贯穿：
-// global: 前缀 → 全局号 + 出站 body 剥前缀 + /console 路径 + ensureConsoleSystem 补 system；
+// global: 前缀 → 全局号 + 出站 body 剥前缀 + /v2 路径（#119 固定单路径） + ensureConsoleSystem 补 system；
 // 裸名 → CN 号 + /v2 路径 + body 原样（零回归）。
 // TestModelsGlobalListGating 断言 GlobalEnabled 逃生门仍生效：true 时 global 域探测名单
 // 可列出（带 global: 前缀）、false 时 global 名单不出现（纯动态，两侧均无静态兜底——
@@ -116,8 +116,8 @@ func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 	if gotModel != "gpt-5.4" {
 		t.Errorf("global chat outbound model=%q want gpt-5.4 (prefix stripped)", gotModel)
 	}
-	if gotPath != "/console/chat/completions" {
-		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
 	}
 	if gotMsgs != 2 { // ensureConsoleSystem：user 前置补 system
 		t.Errorf("global chat messages=%d want 2 (system fallback)", gotMsgs)

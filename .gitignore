@@ -12,6 +12,10 @@ data/
 /credit
 /wb2api
 /signin_bin
+/login.exe
+/credit.exe
+/wb2api.exe
+/signin_bin.exe
 
 # Windows 本地构建产物：start.ps1 / stats.ps1 / login.ps1 把编译好的 exe 落在这里
 # （上游无此目录 —— .sh 与 Dockerfile 都是现场编译、用完即弃）。
@@ -29,6 +33,15 @@ config.json.bak-*
 # Build artifacts
 *.tmp
 __pycache__/
+
+# 运行时产物（API Key / 进程号 / 日志 / 工具草稿目录）
+# 为什么显式列 .apikey：它不是 config.json 的别名，而是 login.sh 等工具单独落盘的密钥文件，
+# 不写进这里会被 git add -A 直接提交（含明文 api_key）。
+.apikey
+.server.pid
+wb2api.pid
+*.log
+draft_*_folder/
 
 # Backups (contains auth tokens)
 backups/
