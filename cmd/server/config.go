@@ -20,16 +20,7 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
-	Server struct {
-		// max_body_mb 已退役（上游 BREAKING）：请求体大小上限整体移除，旧配置中的
-		// 该键因 JSON 未知字段而自然忽略，不报错、无 deprecation 噪音。
-
-		// MetricsEnabled 是否采集按模型的请求统计（默认 true）。
-		MetricsEnabled bool `json:"metrics_enabled"`
-		// MetricsFile 统计持久化文件；空 = 纯内存（重启清零）。
-		// 默认 ./data/metrics.json，重启后累计值不丢。
-		MetricsFile string `json:"metrics_file"`
-	} `json:"server"`
+	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -180,8 +171,6 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	c.Server.MetricsEnabled = true
-	c.Server.MetricsFile = "./data/metrics.json"
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
