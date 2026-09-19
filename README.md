@@ -21,45 +21,48 @@
 
 ## 📌 本仓库与上游的区别
 
-本仓库是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 **fork**，在上游基础上**只增加了一件事：请求统计的终端视图**。账号池治理、调度、双域适配、提示词体系、上游适配等其余能力与上游完全一致。
+本仓库是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 **fork**。统计端点与统计 CLI 均已合入上游，**本 fork 只比上游多一个 PowerShell 包装脚本**（`stats.ps1`）。账号池治理、调度、双域适配、提示词体系、上游适配等其余能力与上游完全一致。
 
-### 统计端点已由上游实现
-
-上游在 2026-09-17 合入了 `GET /v1/stats` 与 `POST /v1/stats/reset`（提交 `733d348`，PR #161），字段名与社区面板约定一致。**本 fork 原先自带的端点实现与落盘累加器已移除**，改用上游版本：
+### 都已在上游
 
 | 项目 | 归属 | 说明 |
 |---|---|---|
-| `GET /v1/stats` / `POST /v1/stats/reset` | **上游** | 按模型聚合的请求统计（需鉴权） |
+| `GET /v1/stats` / `POST /v1/stats/reset` | **上游** | 按模型聚合的请求统计（需鉴权），PR #161 |
 | 统计采集（`internal/server/metrics.go`） | **上游** | 纯内存累加，进程重启即清零；无开关，始终采集 |
-| `cmd/stats/` + `stats.ps1` | **本 fork** | 终端视图，数据源就是上述上游端点 |
+| `cmd/stats/` | **上游** | 终端视图，数据源就是上述端点，PR #172 |
 
-取舍理由：上游版本与社区面板的字段约定对齐（两者逐字一致），且不把统计持久化耦合进网关进程；本 fork 只需补上上游没有的**终端视图**部分。代价是统计窗口在网关重启后清零——这是上游的有意设计（统计是观测值，不是账本）。
+统计窗口在网关重启后清零——这是上游的有意设计（统计是观测值，不是账本），CLI 侧如实展示窗口起点而不做补偿。
 
-### 本 fork 新增的内容
+### 本 fork 唯一新增
 
 | 项目 | 说明 |
 |---|---|
-| `cmd/stats/` | 终端视图（替代 Web 面板），纯 HTTP 客户端，不含采集逻辑 |
-| `stats.ps1` | PowerShell 包装：按需自动编译 + 传参 |
+| `stats.ps1` | `cmd/stats` 的 PowerShell 包装：按需自动编译（源码比二进制新时重编）+ 参数透传 |
+
+上游已有的 `cmd/stats` 用法：
+
+```powershell
+go build -o bin/stats.exe ./cmd/stats
+.\bin\stats.exe                    # 一次性快照
+.\bin\stats.exe -watch 5s          # 原地刷新（Ctrl+C 退出）
+.\bin\stats.exe -watch 5s -alt-screen  # 备用屏绘制，退出时还原原屏
+.\bin\stats.exe -json              # 供脚本消费
+.\bin\stats.exe -sort ttfb         # requests | ttfb | tokens | credit
+.\bin\stats.exe -server http://127.0.0.1:7863  # 直接指定网关地址
+.\bin\stats.exe -h                 # 全部参数
+```
 
 ### 终端视图
+
+上游的 `cmd/stats` 本机可直接 `go run ./cmd/stats`。本 fork 的 `stats.ps1` 额外做了两件事：**源码比二进制新时自动重编译**（避免"改了代码没生效"被误判为改动无效，这是上游脚本没有的能力），以及把 PowerShell 参数映射为 CLI flag：
 
 ```powershell
 pwsh -File ./stats.ps1                 # 一次性快照
 pwsh -File ./stats.ps1 -Watch 5s       # 持续刷新（Ctrl+C 退出）
 pwsh -File ./stats.ps1 -Sort credit    # requests | ttfb | tokens | credit
+pwsh -File ./stats.ps1 -Server http://127.0.0.1:7863   # 直接指定网关地址
 pwsh -File ./stats.ps1 -Width 130      # 指定列宽（默认自动探测终端）
 pwsh -File ./stats.ps1 -Json           # 原始 JSON
-```
-
-也可直接用二进制：
-
-```powershell
-go build -o bin/stats.exe ./cmd/stats
-.\bin\stats.exe -watch 5s               # 原地刷新
-.\bin\stats.exe -watch 5s -alt-screen   # 备用屏绘制，退出时还原原屏
-.\bin\stats.exe -json                   # 供脚本消费
-.\bin\stats.exe -h                      # 全部参数
 ```
 
 ```text
@@ -78,11 +81,11 @@ go build -o bin/stats.exe ./cmd/stats
 
 ### 对上游既有文件的改动
 
-**零改动** —— 本 fork 只在 `cmd/stats/` 与 `stats.ps1` 中新增文件，不修改上游任何既有文件。其余文件与上游逐字一致。
+**零改动** —— 本 fork 只新增 `stats.ps1` 一个文件，不修改上游任何既有文件。其余文件与上游逐字一致。
 
 **上游的免责声明、授权边界与合规要求对本 fork 同样适用**，见下方对应章节。
 
-> 本 fork 保持上游「不内嵌 Web 管理面板」的理念 —— 统计视图是**终端命令**，不引入常驻服务。需要 Web 面板的用户请使用下方「社区前端面板」中的独立项目（它直接消费上游的 `/v1/stats`）。
+> 本 fork 保持上游「不内嵌 Web 管理面板」的理念 —— 统计视图是**终端命令**（`cmd/stats`，上游已内置），不引入常驻服务。需要 Web 面板的用户请使用下方「社区前端面板」中的独立项目（它直接消费上游的 `/v1/stats`）。
 
 ---
 
